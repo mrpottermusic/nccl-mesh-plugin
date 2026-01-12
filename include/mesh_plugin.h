@@ -17,6 +17,10 @@
 #define MESH_MAX_MRS 1024
 #define MESH_HANDLE_MAGIC 0x4D455348  // "MESH"
 
+// Connection pool settings (TICKET-6)
+#define MESH_CONN_POOL_SIZE 64        // Max pooled connections per NIC
+#define MESH_ASYNC_QUEUE_SIZE 32      // Pending async connect requests
+
 // Forward declarations
 struct mesh_plugin_state;
 struct mesh_nic;
@@ -165,6 +169,14 @@ struct mesh_send_comm {
     int last_wc_status;         // Last WC error status (for diagnostics)
     uint64_t error_count;       // Number of errors seen
 
+    // Connection pooling (TICKET-6)
+    struct mesh_conn_pool_entry *pool_entry;  // Pooled connection (if using pool)
+    uint32_t peer_ip;           // Peer IP for pool lookup
+
+    // Async connect (TICKET-7)
+    struct mesh_async_connect_req *async_req; // Pending async connect request
+    int connect_pending;        // 1 if waiting for async connect to complete
+
     // Request tracking
     struct mesh_request *requests[MESH_MAX_QPS];
     int num_requests;
@@ -248,6 +260,67 @@ struct mesh_tcp_request {
 };
 
 /*
+ * Connection pool entry (TICKET-6)
+ * Represents a reusable QP connection to a specific peer
+ */
+struct mesh_conn_pool_entry {
+    int in_use;                 // 1 if currently assigned to a comm
+    int valid;                  // 1 if QP is connected and usable
+    uint32_t peer_ip;           // Remote peer IP (host byte order)
+    uint32_t remote_qp_num;     // Remote QP number
+    struct mesh_nic *nic;       // Local NIC
+    struct ibv_qp *qp;          // Queue pair
+    struct ibv_cq *cq;          // Completion queue
+    uint64_t last_used;         // Timestamp of last use (for LRU eviction)
+    int ref_count;              // Number of comms using this connection
+};
+
+/*
+ * Connection pool (TICKET-6)
+ * Pools QP connections for reuse between same node pairs
+ */
+struct mesh_conn_pool {
+    struct mesh_conn_pool_entry entries[MESH_CONN_POOL_SIZE];
+    int num_entries;
+    pthread_mutex_t mutex;      // Protects pool access
+    uint64_t hits;              // Cache hits
+    uint64_t misses;            // Cache misses
+};
+
+/*
+ * Async connect request (TICKET-7)
+ * Queued for background connection establishment
+ */
+struct mesh_async_connect_req {
+    int valid;                  // 1 if this slot is in use
+    int complete;               // 1 if connection is established
+    int error;                  // Error code if failed
+    struct mesh_handle handle;  // Copy of peer handle
+    struct mesh_nic *nic;       // Selected NIC
+    struct mesh_addr_entry *selected_addr;  // Selected peer address
+    uint32_t peer_ip;           // Peer IP for lookup
+    struct ibv_qp *qp;          // Created QP (set when complete)
+    struct ibv_cq *cq;          // Created CQ (set when complete)
+    uint32_t remote_qp_num;     // Remote QP number (set when complete)
+    void *send_comm;            // Associated send_comm waiting for this
+};
+
+/*
+ * Async connect state (TICKET-7)
+ * Background thread for non-blocking connection establishment
+ */
+struct mesh_async_connect_state {
+    pthread_t thread;           // Background connect thread
+    int thread_running;         // 1 if thread is active
+    int thread_stop;            // 1 to signal thread to stop
+    struct mesh_async_connect_req queue[MESH_ASYNC_QUEUE_SIZE];
+    int queue_head;             // Next slot to consume
+    int queue_tail;             // Next slot to produce
+    pthread_mutex_t mutex;      // Protects queue
+    pthread_cond_t cond;        // Signals new work available
+};
+
+/*
  * Async request state
  */
 struct mesh_request {
@@ -276,9 +349,21 @@ struct mesh_plugin_state {
     int retry_count;            // NCCL_MESH_RETRY_COUNT: retry attempts (default: 3)
     int disable_rdma;           // NCCL_MESH_DISABLE_RDMA: force TCP fallback
 
+    // Connection pooling config (TICKET-6)
+    int enable_conn_pool;       // NCCL_MESH_CONN_POOL: enable connection pooling (default: 1)
+
+    // Async connect config (TICKET-7)
+    int enable_async_connect;   // NCCL_MESH_ASYNC_CONNECT: enable async connect (default: 1)
+
     // TCP fallback state (TICKET-4)
     int tcp_fallback_active;    // 1 if using TCP fallback, 0 if RDMA
     int rdma_init_failed;       // 1 if RDMA init failed (used to trigger fallback)
+
+    // Connection pool (TICKET-6)
+    struct mesh_conn_pool conn_pool;
+
+    // Async connect state (TICKET-7)
+    struct mesh_async_connect_state async_connect;
 
     // Logging (provided by NCCL)
     void (*log_fn)(int level, unsigned long flags, const char *file,
@@ -315,6 +400,24 @@ int mesh_poll_cq(struct ibv_cq *cq, struct mesh_request *req);
 int mesh_cache_gid(struct mesh_nic *nic);
 int mesh_validate_gid(struct mesh_nic *nic);
 int mesh_get_gid(struct mesh_nic *nic, union ibv_gid *gid);
+
+// Connection pool (TICKET-6)
+int mesh_conn_pool_init(void);
+void mesh_conn_pool_destroy(void);
+struct mesh_conn_pool_entry* mesh_conn_pool_acquire(uint32_t peer_ip, struct mesh_nic *nic);
+void mesh_conn_pool_release(struct mesh_conn_pool_entry *entry);
+struct mesh_conn_pool_entry* mesh_conn_pool_find(uint32_t peer_ip, struct mesh_nic *nic);
+int mesh_conn_pool_add(uint32_t peer_ip, struct mesh_nic *nic,
+                       struct ibv_qp *qp, struct ibv_cq *cq, uint32_t remote_qp_num);
+
+// Async connect (TICKET-7)
+int mesh_async_connect_init(void);
+void mesh_async_connect_destroy(void);
+struct mesh_async_connect_req* mesh_async_connect_submit(struct mesh_handle *handle,
+                                                          struct mesh_nic *nic,
+                                                          struct mesh_addr_entry *addr,
+                                                          void *send_comm);
+int mesh_async_connect_poll(struct mesh_async_connect_req *req);
 
 // TCP fallback operations (TICKET-4)
 int mesh_tcp_init(void);

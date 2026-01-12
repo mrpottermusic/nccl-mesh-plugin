@@ -831,6 +831,436 @@ int mesh_connect_qp(struct ibv_qp *qp, struct mesh_nic *nic, struct mesh_handle 
 
 /*
  * ============================================================================
+ * Connection Pool Implementation (TICKET-6)
+ * ============================================================================
+ *
+ * Pools QP connections for reuse between same node pairs. This significantly
+ * improves performance when FSDP/ZeRO creates many communicators during the
+ * wrap phase, as we avoid the overhead of creating new QPs for each one.
+ */
+
+/*
+ * Initialize the connection pool
+ */
+int mesh_conn_pool_init(void) {
+    struct mesh_conn_pool *pool = &g_mesh_state.conn_pool;
+
+    memset(pool, 0, sizeof(*pool));
+    pthread_mutex_init(&pool->mutex, NULL);
+
+    MESH_INFO("Connection pool initialized (max %d entries)", MESH_CONN_POOL_SIZE);
+    return 0;
+}
+
+/*
+ * Destroy the connection pool and clean up all connections
+ */
+void mesh_conn_pool_destroy(void) {
+    struct mesh_conn_pool *pool = &g_mesh_state.conn_pool;
+
+    pthread_mutex_lock(&pool->mutex);
+
+    for (int i = 0; i < pool->num_entries; i++) {
+        struct mesh_conn_pool_entry *entry = &pool->entries[i];
+        if (entry->valid) {
+            if (entry->qp) ibv_destroy_qp(entry->qp);
+            if (entry->cq) ibv_destroy_cq(entry->cq);
+            entry->valid = 0;
+        }
+    }
+
+    pool->num_entries = 0;
+
+    pthread_mutex_unlock(&pool->mutex);
+    pthread_mutex_destroy(&pool->mutex);
+
+    MESH_INFO("Connection pool destroyed (hits=%lu, misses=%lu)",
+              pool->hits, pool->misses);
+}
+
+/*
+ * Find an existing pooled connection to a peer
+ * Returns NULL if not found
+ */
+struct mesh_conn_pool_entry* mesh_conn_pool_find(uint32_t peer_ip, struct mesh_nic *nic) {
+    struct mesh_conn_pool *pool = &g_mesh_state.conn_pool;
+    struct mesh_conn_pool_entry *found = NULL;
+
+    pthread_mutex_lock(&pool->mutex);
+
+    for (int i = 0; i < pool->num_entries; i++) {
+        struct mesh_conn_pool_entry *entry = &pool->entries[i];
+        if (entry->valid && entry->peer_ip == peer_ip && entry->nic == nic) {
+            found = entry;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&pool->mutex);
+    return found;
+}
+
+/*
+ * Acquire a pooled connection to a peer
+ * Returns existing connection if available, NULL if none available
+ */
+struct mesh_conn_pool_entry* mesh_conn_pool_acquire(uint32_t peer_ip, struct mesh_nic *nic) {
+    struct mesh_conn_pool *pool = &g_mesh_state.conn_pool;
+    struct mesh_conn_pool_entry *entry = NULL;
+    struct timespec ts;
+
+    pthread_mutex_lock(&pool->mutex);
+
+    // Look for existing connection to this peer
+    for (int i = 0; i < pool->num_entries; i++) {
+        struct mesh_conn_pool_entry *e = &pool->entries[i];
+        if (e->valid && !e->in_use && e->peer_ip == peer_ip && e->nic == nic) {
+            entry = e;
+            break;
+        }
+    }
+
+    if (entry) {
+        entry->in_use = 1;
+        entry->ref_count++;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        entry->last_used = ts.tv_sec;
+        pool->hits++;
+
+        char ip_str[INET_ADDRSTRLEN];
+        mesh_uint_to_ip(peer_ip, ip_str, sizeof(ip_str));
+        MESH_DEBUG("Pool hit: reusing connection to %s (QP %d, ref_count=%d)",
+                   ip_str, entry->qp->qp_num, entry->ref_count);
+    } else {
+        pool->misses++;
+    }
+
+    pthread_mutex_unlock(&pool->mutex);
+    return entry;
+}
+
+/*
+ * Release a pooled connection back to the pool
+ */
+void mesh_conn_pool_release(struct mesh_conn_pool_entry *entry) {
+    struct mesh_conn_pool *pool = &g_mesh_state.conn_pool;
+
+    if (!entry) return;
+
+    pthread_mutex_lock(&pool->mutex);
+
+    entry->ref_count--;
+    if (entry->ref_count <= 0) {
+        entry->in_use = 0;
+        entry->ref_count = 0;
+
+        char ip_str[INET_ADDRSTRLEN];
+        mesh_uint_to_ip(entry->peer_ip, ip_str, sizeof(ip_str));
+        MESH_DEBUG("Pool release: connection to %s available for reuse", ip_str);
+    }
+
+    pthread_mutex_unlock(&pool->mutex);
+}
+
+/*
+ * Add a new connection to the pool
+ * Returns 0 on success, -1 if pool is full
+ */
+int mesh_conn_pool_add(uint32_t peer_ip, struct mesh_nic *nic,
+                       struct ibv_qp *qp, struct ibv_cq *cq, uint32_t remote_qp_num) {
+    struct mesh_conn_pool *pool = &g_mesh_state.conn_pool;
+    struct mesh_conn_pool_entry *entry = NULL;
+    struct timespec ts;
+    int result = -1;
+
+    pthread_mutex_lock(&pool->mutex);
+
+    // Find a free slot or evict LRU entry
+    if (pool->num_entries < MESH_CONN_POOL_SIZE) {
+        entry = &pool->entries[pool->num_entries];
+        pool->num_entries++;
+    } else {
+        // Find LRU entry that's not in use
+        uint64_t oldest_time = UINT64_MAX;
+        for (int i = 0; i < pool->num_entries; i++) {
+            struct mesh_conn_pool_entry *e = &pool->entries[i];
+            if (!e->in_use && e->last_used < oldest_time) {
+                oldest_time = e->last_used;
+                entry = e;
+            }
+        }
+
+        if (entry) {
+            // Evict old entry
+            char ip_str[INET_ADDRSTRLEN];
+            mesh_uint_to_ip(entry->peer_ip, ip_str, sizeof(ip_str));
+            MESH_DEBUG("Pool evict: removing connection to %s", ip_str);
+
+            if (entry->qp) ibv_destroy_qp(entry->qp);
+            if (entry->cq) ibv_destroy_cq(entry->cq);
+        }
+    }
+
+    if (entry) {
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+
+        entry->valid = 1;
+        entry->in_use = 1;
+        entry->ref_count = 1;
+        entry->peer_ip = peer_ip;
+        entry->remote_qp_num = remote_qp_num;
+        entry->nic = nic;
+        entry->qp = qp;
+        entry->cq = cq;
+        entry->last_used = ts.tv_sec;
+
+        char ip_str[INET_ADDRSTRLEN];
+        mesh_uint_to_ip(peer_ip, ip_str, sizeof(ip_str));
+        MESH_DEBUG("Pool add: new connection to %s (QP %d)", ip_str, qp->qp_num);
+
+        result = 0;
+    } else {
+        MESH_WARN("Connection pool full, cannot add new entry");
+    }
+
+    pthread_mutex_unlock(&pool->mutex);
+    return result;
+}
+
+/*
+ * ============================================================================
+ * Async Connect Implementation (TICKET-7)
+ * ============================================================================
+ *
+ * Background thread for non-blocking connection establishment. This allows
+ * mesh_connect() to return early while the handshake completes in the background,
+ * improving performance when setting up connections to multiple peers.
+ */
+
+/*
+ * Background thread for async connection establishment
+ */
+static void *async_connect_thread_func(void *arg) {
+    (void)arg;
+    struct mesh_async_connect_state *state = &g_mesh_state.async_connect;
+
+    MESH_DEBUG("Async connect thread started");
+
+    while (!state->thread_stop) {
+        struct mesh_async_connect_req *req = NULL;
+
+        pthread_mutex_lock(&state->mutex);
+
+        // Wait for work
+        while (state->queue_head == state->queue_tail && !state->thread_stop) {
+            pthread_cond_wait(&state->cond, &state->mutex);
+        }
+
+        if (state->thread_stop) {
+            pthread_mutex_unlock(&state->mutex);
+            break;
+        }
+
+        // Get next request
+        req = &state->queue[state->queue_head];
+        if (req->valid && !req->complete) {
+            pthread_mutex_unlock(&state->mutex);
+
+            // Perform the connection (outside lock)
+            char ip_str[INET_ADDRSTRLEN];
+            mesh_uint_to_ip(req->peer_ip, ip_str, sizeof(ip_str));
+            MESH_DEBUG("Async connect: processing request for %s", ip_str);
+
+            // Create QP
+            if (mesh_create_qp(req->nic, &req->qp, &req->cq) != 0) {
+                req->error = 1;
+                req->complete = 1;
+                MESH_WARN("Async connect: failed to create QP for %s", ip_str);
+                continue;
+            }
+
+            // Do handshake
+            struct mesh_qp_info local_info, remote_info;
+            memset(&local_info, 0, sizeof(local_info));
+            local_info.qp_num = htonl(req->qp->qp_num);
+            local_info.psn = htonl(0);
+            local_info.ip = htonl(req->nic->ip_addr);
+            local_info.gid_index = req->nic->gid_index;
+            local_info.nic_idx = req->selected_addr->nic_idx;
+
+            union ibv_gid our_gid;
+            if (mesh_get_gid(req->nic, &our_gid) == 0) {
+                memcpy(local_info.gid, our_gid.raw, 16);
+            }
+
+            uint32_t handshake_ip = ntohl(req->selected_addr->ip);
+            if (mesh_send_handshake(handshake_ip, req->handle.handshake_port,
+                                    &local_info, &remote_info) != 0) {
+                req->error = 1;
+                req->complete = 1;
+                ibv_destroy_qp(req->qp);
+                ibv_destroy_cq(req->cq);
+                req->qp = NULL;
+                req->cq = NULL;
+                MESH_WARN("Async connect: handshake failed for %s", ip_str);
+                continue;
+            }
+
+            usleep(1000);  // Small delay for acceptor's QP to be ready
+
+            // Connect QP
+            struct mesh_handle connect_handle;
+            memset(&connect_handle, 0, sizeof(connect_handle));
+            connect_handle.qp_num = ntohl(remote_info.qp_num);
+            connect_handle.psn = ntohl(remote_info.psn);
+            connect_handle.port_num = req->nic->port_num;
+            connect_handle.mtu = IBV_MTU_4096;
+
+            // Construct peer GID
+            union ibv_gid peer_gid;
+            memset(&peer_gid, 0, sizeof(peer_gid));
+            peer_gid.raw[10] = 0xff;
+            peer_gid.raw[11] = 0xff;
+            uint32_t remote_ip_for_gid = remote_info.ip ? remote_info.ip : req->selected_addr->ip;
+            memcpy(&peer_gid.raw[12], &remote_ip_for_gid, 4);
+            connect_handle.gid = peer_gid;
+
+            if (mesh_connect_qp(req->qp, req->nic, &connect_handle) != 0) {
+                req->error = 1;
+                req->complete = 1;
+                ibv_destroy_qp(req->qp);
+                ibv_destroy_cq(req->cq);
+                req->qp = NULL;
+                req->cq = NULL;
+                MESH_WARN("Async connect: QP connect failed for %s", ip_str);
+                continue;
+            }
+
+            req->remote_qp_num = connect_handle.qp_num;
+            req->complete = 1;
+            req->error = 0;
+
+            MESH_DEBUG("Async connect: completed for %s (QP %d -> %d)",
+                       ip_str, req->qp->qp_num, req->remote_qp_num);
+
+            pthread_mutex_lock(&state->mutex);
+        }
+
+        // Advance queue head
+        state->queue_head = (state->queue_head + 1) % MESH_ASYNC_QUEUE_SIZE;
+        pthread_mutex_unlock(&state->mutex);
+    }
+
+    MESH_DEBUG("Async connect thread stopped");
+    return NULL;
+}
+
+/*
+ * Initialize async connect state
+ */
+int mesh_async_connect_init(void) {
+    struct mesh_async_connect_state *state = &g_mesh_state.async_connect;
+
+    memset(state, 0, sizeof(*state));
+    pthread_mutex_init(&state->mutex, NULL);
+    pthread_cond_init(&state->cond, NULL);
+
+    if (pthread_create(&state->thread, NULL, async_connect_thread_func, NULL) != 0) {
+        MESH_WARN("Failed to create async connect thread");
+        return -1;
+    }
+
+    state->thread_running = 1;
+    MESH_INFO("Async connect thread initialized");
+    return 0;
+}
+
+/*
+ * Destroy async connect state
+ */
+void mesh_async_connect_destroy(void) {
+    struct mesh_async_connect_state *state = &g_mesh_state.async_connect;
+
+    if (state->thread_running) {
+        pthread_mutex_lock(&state->mutex);
+        state->thread_stop = 1;
+        pthread_cond_broadcast(&state->cond);
+        pthread_mutex_unlock(&state->mutex);
+
+        pthread_join(state->thread, NULL);
+        state->thread_running = 0;
+    }
+
+    // Clean up any pending requests
+    for (int i = 0; i < MESH_ASYNC_QUEUE_SIZE; i++) {
+        struct mesh_async_connect_req *req = &state->queue[i];
+        if (req->valid && req->qp) {
+            ibv_destroy_qp(req->qp);
+        }
+        if (req->valid && req->cq) {
+            ibv_destroy_cq(req->cq);
+        }
+    }
+
+    pthread_mutex_destroy(&state->mutex);
+    pthread_cond_destroy(&state->cond);
+
+    MESH_INFO("Async connect destroyed");
+}
+
+/*
+ * Submit an async connect request
+ * Returns request handle for polling, or NULL on error
+ */
+struct mesh_async_connect_req* mesh_async_connect_submit(struct mesh_handle *handle,
+                                                          struct mesh_nic *nic,
+                                                          struct mesh_addr_entry *addr,
+                                                          void *send_comm) {
+    struct mesh_async_connect_state *state = &g_mesh_state.async_connect;
+    struct mesh_async_connect_req *req = NULL;
+
+    pthread_mutex_lock(&state->mutex);
+
+    // Find free slot
+    int next_tail = (state->queue_tail + 1) % MESH_ASYNC_QUEUE_SIZE;
+    if (next_tail != state->queue_head) {
+        req = &state->queue[state->queue_tail];
+
+        memset(req, 0, sizeof(*req));
+        req->valid = 1;
+        req->complete = 0;
+        req->error = 0;
+        memcpy(&req->handle, handle, sizeof(*handle));
+        req->nic = nic;
+        req->selected_addr = addr;
+        req->peer_ip = ntohl(addr->ip);
+        req->send_comm = send_comm;
+
+        state->queue_tail = next_tail;
+        pthread_cond_signal(&state->cond);
+
+        char ip_str[INET_ADDRSTRLEN];
+        mesh_uint_to_ip(req->peer_ip, ip_str, sizeof(ip_str));
+        MESH_DEBUG("Async connect: submitted request for %s", ip_str);
+    } else {
+        MESH_WARN("Async connect queue full");
+    }
+
+    pthread_mutex_unlock(&state->mutex);
+    return req;
+}
+
+/*
+ * Poll an async connect request for completion
+ * Returns 1 if complete (success or error), 0 if still pending
+ */
+int mesh_async_connect_poll(struct mesh_async_connect_req *req) {
+    if (!req) return 1;
+    return req->complete;
+}
+
+/*
+ * ============================================================================
  * TCP Fallback Implementation (TICKET-4)
  * ============================================================================
  *
@@ -1505,14 +1935,24 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
     g_mesh_state.retry_count = env_val ? atoi(env_val) : 3;
     if (g_mesh_state.retry_count < 1) g_mesh_state.retry_count = 1;  // Minimum 1
 
-    // NCCL_MESH_DISABLE_RDMA: Force TCP fallback (default: 0, not implemented)
+    // NCCL_MESH_DISABLE_RDMA: Force TCP fallback (default: 0)
     env_val = getenv("NCCL_MESH_DISABLE_RDMA");
     g_mesh_state.disable_rdma = env_val ? atoi(env_val) : 0;
 
+    // NCCL_MESH_CONN_POOL: Enable connection pooling (default: 1) (TICKET-6)
+    env_val = getenv("NCCL_MESH_CONN_POOL");
+    g_mesh_state.enable_conn_pool = env_val ? atoi(env_val) : 1;
+
+    // NCCL_MESH_ASYNC_CONNECT: Enable async connection (default: 1) (TICKET-7)
+    env_val = getenv("NCCL_MESH_ASYNC_CONNECT");
+    g_mesh_state.enable_async_connect = env_val ? atoi(env_val) : 1;
+
     // Log configuration (always shown at init, regardless of debug level)
-    MESH_LOG(NCCL_LOG_INFO, "MESH Initializing: gid=%d debug=%d fast_fail=%d timeout=%dms retries=%d disable_rdma=%d",
+    MESH_LOG(NCCL_LOG_INFO, "MESH Initializing: gid=%d debug=%d fast_fail=%d timeout=%dms retries=%d "
+             "disable_rdma=%d conn_pool=%d async_connect=%d",
              g_mesh_state.gid_index, g_mesh_state.debug_level, g_mesh_state.fast_fail,
-             g_mesh_state.timeout_ms, g_mesh_state.retry_count, g_mesh_state.disable_rdma);
+             g_mesh_state.timeout_ms, g_mesh_state.retry_count, g_mesh_state.disable_rdma,
+             g_mesh_state.enable_conn_pool, g_mesh_state.enable_async_connect);
 
     // Check if TCP fallback is forced (TICKET-4)
     if (g_mesh_state.disable_rdma) {
@@ -1539,6 +1979,16 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
         g_mesh_state.initialized = 1;
         MESH_INFO("Mesh plugin initialized in TCP fallback mode with %d interfaces", g_mesh_state.num_nics);
         return ncclSuccess;
+    }
+
+    // Initialize connection pool if enabled (TICKET-6)
+    if (g_mesh_state.enable_conn_pool) {
+        mesh_conn_pool_init();
+    }
+
+    // Initialize async connect if enabled (TICKET-7)
+    if (g_mesh_state.enable_async_connect) {
+        mesh_async_connect_init();
     }
 
     g_mesh_state.initialized = 1;
@@ -1748,30 +2198,53 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
         return ncclSystemError;
     }
     
+    uint32_t peer_ip = ntohl(selected_addr->ip);
     char peer_ip_str[INET_ADDRSTRLEN];
-    mesh_uint_to_ip(ntohl(selected_addr->ip), peer_ip_str, sizeof(peer_ip_str));
-    
+    mesh_uint_to_ip(peer_ip, peer_ip_str, sizeof(peer_ip_str));
+
     // Allocate send comm
     comm = calloc(1, sizeof(*comm));
     if (!comm) {
         return ncclSystemError;
     }
-    
+
     comm->nic = nic;
-    
+    comm->peer_ip = peer_ip;
+
+    // TICKET-6: Check connection pool for existing connection to this peer
+    if (g_mesh_state.enable_conn_pool) {
+        struct mesh_conn_pool_entry *pool_entry = mesh_conn_pool_acquire(peer_ip, nic);
+        if (pool_entry) {
+            // Pool hit - reuse existing connection
+            comm->qp = pool_entry->qp;
+            comm->cq = pool_entry->cq;
+            comm->pool_entry = pool_entry;
+            comm->remote_qp_num = pool_entry->remote_qp_num;
+            comm->connected = 1;
+
+            MESH_INFO("connect: Pool hit - reusing connection to %s (QP %d -> %d)",
+                      peer_ip_str, comm->qp->qp_num, comm->remote_qp_num);
+
+            *sendComm = comm;
+            if (sendDevComm) *sendDevComm = NULL;
+            return ncclSuccess;
+        }
+        MESH_DEBUG("connect: Pool miss for %s, creating new connection", peer_ip_str);
+    }
+
     // Create QP on the selected NIC
     if (mesh_create_qp(nic, &comm->qp, &comm->cq) != 0) {
         free(comm);
         return ncclSystemError;
     }
-    
-    
+
+
     // Do handshake FIRST to get accept's QP number
     struct mesh_qp_info remote_qp_info;
     memset(&remote_qp_info, 0, sizeof(remote_qp_info));
-    
+
     if (handle->handshake_port > 0) {
-        
+
         struct mesh_qp_info local_info;
         memset(&local_info, 0, sizeof(local_info));
         local_info.qp_num = htonl(comm->qp->qp_num);
@@ -1779,19 +2252,19 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
         local_info.ip = htonl(nic->ip_addr);
         local_info.gid_index = nic->gid_index;
         local_info.nic_idx = selected_addr->nic_idx;  // Which of listener's NICs we want
-        
+
         // Copy our GID (TICKET-5: use cached GID)
         union ibv_gid our_gid;
         if (mesh_get_gid(nic, &our_gid) == 0) {
             memcpy(local_info.gid, our_gid.raw, 16);
         }
-        
+
         // Bidirectional handshake - send our info, receive accept's info
         uint32_t handshake_ip = ntohl(selected_addr->ip);
-        
+
         char hs_ip_str[INET_ADDRSTRLEN];
         mesh_uint_to_ip(handshake_ip, hs_ip_str, sizeof(hs_ip_str));
-        
+
         if (mesh_send_handshake(handshake_ip, handle->handshake_port, &local_info, &remote_qp_info) != 0) {
             MESH_WARN("connect: Bidirectional handshake failed");
             ibv_destroy_qp(comm->qp);
@@ -1811,7 +2284,7 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
         remote_qp_info.psn = htonl(handle->psn);
         remote_qp_info.ip = selected_addr->ip;
     }
-    
+
     // Now connect our QP to the ACCEPT's QP (from handshake response)
     struct mesh_handle connect_handle;
     memset(&connect_handle, 0, sizeof(connect_handle));
@@ -1820,7 +2293,7 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
     connect_handle.lid = 0;  // RoCE uses GID, not LID
     connect_handle.port_num = nic->port_num;
     connect_handle.mtu = IBV_MTU_4096;
-    
+
     // Construct peer GID from their IP
     union ibv_gid peer_gid;
     memset(&peer_gid, 0, sizeof(peer_gid));
@@ -1832,8 +2305,8 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
     }
     memcpy(&peer_gid.raw[12], &remote_ip_for_gid, 4);
     connect_handle.gid = peer_gid;
-    
-    
+
+
     // Connect QP to remote
     if (mesh_connect_qp(comm->qp, nic, &connect_handle) != 0) {
         MESH_WARN("connect: Failed to connect QP to peer");
@@ -1842,14 +2315,22 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
         free(comm);
         return ncclSystemError;
     }
-    
+
     comm->connected = 1;
     comm->remote_qp_num = connect_handle.qp_num;
-    
-    MESH_INFO("connect: Connected to peer %s via NIC %s (local QP %d -> remote QP %d)", 
+
+    // TICKET-6: Add new connection to pool
+    if (g_mesh_state.enable_conn_pool) {
+        if (mesh_conn_pool_add(peer_ip, nic, comm->qp, comm->cq, comm->remote_qp_num) == 0) {
+            // Find the entry we just added
+            comm->pool_entry = mesh_conn_pool_find(peer_ip, nic);
+        }
+    }
+
+    MESH_INFO("connect: Connected to peer %s via NIC %s (local QP %d -> remote QP %d)",
               peer_ip_str, nic->dev_name, comm->qp->qp_num, connect_handle.qp_num);
-    
-    
+
+
     *sendComm = comm;
     if (sendDevComm) *sendDevComm = NULL;
     return ncclSuccess;
@@ -2274,8 +2755,15 @@ static ncclResult_t mesh_closeSend(void *sendComm) {
     struct mesh_send_comm *comm = (struct mesh_send_comm *)sendComm;
 
     if (comm) {
-        if (comm->qp) ibv_destroy_qp(comm->qp);
-        if (comm->cq) ibv_destroy_cq(comm->cq);
+        // TICKET-6: Release pooled connection instead of destroying
+        if (comm->pool_entry) {
+            mesh_conn_pool_release(comm->pool_entry);
+            // Don't destroy QP/CQ - they belong to the pool
+        } else {
+            // Not pooled - destroy resources
+            if (comm->qp) ibv_destroy_qp(comm->qp);
+            if (comm->cq) ibv_destroy_cq(comm->cq);
+        }
         free(comm);
     }
 
