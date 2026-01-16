@@ -1720,9 +1720,10 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
     int flags = fcntl(comm->sock, F_GETFL, 0);
     fcntl(comm->sock, F_SETFL, flags | O_NONBLOCK);
 
-    // Try to receive size header
+    // Try to peek at the size header first to check availability
+    // TICKET-10: Don't use MSG_WAITALL on non-blocking socket - it's unreliable
     uint32_t net_size;
-    ssize_t recvd = recv(comm->sock, &net_size, sizeof(net_size), MSG_WAITALL);
+    ssize_t recvd = recv(comm->sock, &net_size, sizeof(net_size), MSG_PEEK);
 
     if (recvd == 0) {
         // Connection closed
@@ -1737,8 +1738,27 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
         fcntl(comm->sock, F_SETFL, flags);
         *request = req;
         return ncclSuccess;
-    } else if (recvd != sizeof(net_size)) {
+    } else if (recvd < (ssize_t)sizeof(net_size)) {
+        // Partial header or error - wait for more data in test()
+        if (recvd > 0) {
+            // Partial header available, poll again later
+            fcntl(comm->sock, F_SETFL, flags);
+            *request = req;
+            return ncclSuccess;
+        }
         MESH_WARN("TCP irecv: Failed to receive header: %s", strerror(errno));
+        comm->peer_failed = 1;
+        comm->last_errno = errno;
+        fcntl(comm->sock, F_SETFL, flags);
+        __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+        free(req);
+        return ncclSystemError;
+    }
+
+    // Full header available via peek, now consume it
+    recvd = recv(comm->sock, &net_size, sizeof(net_size), 0);
+    if (recvd != sizeof(net_size)) {
+        MESH_WARN("TCP irecv: Failed to consume header: %s", strerror(errno));
         comm->peer_failed = 1;
         comm->last_errno = errno;
         fcntl(comm->sock, F_SETFL, flags);
@@ -1758,12 +1778,23 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
         return ncclSystemError;
     }
 
-    // Receive data
+    // Receive data with timeout to prevent indefinite hangs (TICKET-10)
     size_t total_recvd = 0;
+    int timeout_retries = 0;
+    int max_timeout_retries = g_mesh_state.timeout_ms * 100;  // 100us per retry
     while (total_recvd < msg_size) {
         recvd = recv(comm->sock, (char *)data[0] + total_recvd, msg_size - total_recvd, 0);
         if (recvd <= 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (++timeout_retries > max_timeout_retries) {
+                    MESH_WARN("TCP irecv: Data receive timed out after %d ms", g_mesh_state.timeout_ms);
+                    comm->peer_failed = 1;
+                    comm->last_errno = ETIMEDOUT;
+                    req->error = ETIMEDOUT;
+                    req->done = 1;
+                    *request = req;
+                    return ncclSystemError;
+                }
                 usleep(100);
                 continue;
             }
@@ -1776,6 +1807,7 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
             return ncclSystemError;
         }
         total_recvd += recvd;
+        timeout_retries = 0;  // Reset timeout on progress
     }
 
     req->size = msg_size;
@@ -1817,9 +1849,21 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
         ssize_t recvd = recv(comm->sock, &net_size, sizeof(net_size), MSG_PEEK);
 
         if (recvd == sizeof(net_size)) {
-            // Header available - do full receive
-            recv(comm->sock, &net_size, sizeof(net_size), MSG_WAITALL);
-            fcntl(comm->sock, F_SETFL, flags);
+            // Header available via peek - consume it without MSG_WAITALL
+            // TICKET-10: Don't use MSG_WAITALL on non-blocking socket
+            recvd = recv(comm->sock, &net_size, sizeof(net_size), 0);
+            fcntl(comm->sock, F_SETFL, flags);  // Restore flags before data recv
+
+            if (recvd != sizeof(net_size)) {
+                // Should not happen since peek confirmed availability
+                req->error = errno ? errno : EPROTO;
+                req->done = 1;
+                *done = 1;
+                __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
+                free(req);
+                return ncclSystemError;
+            }
 
             uint32_t msg_size = ntohl(net_size);
             if (msg_size > req->size) {
@@ -1832,12 +1876,24 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 return ncclSystemError;
             }
 
-            // Receive data
+            // Receive data with timeout to prevent indefinite hangs (TICKET-10)
             size_t total_recvd = 0;
+            int timeout_retries = 0;
+            int max_timeout_retries = g_mesh_state.timeout_ms * 100;  // 100us per retry
             while (total_recvd < msg_size) {
                 recvd = recv(comm->sock, (char *)req->data + total_recvd, msg_size - total_recvd, 0);
                 if (recvd <= 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        if (++timeout_retries > max_timeout_retries) {
+                            MESH_WARN("TCP test: Data receive timed out after %d ms", g_mesh_state.timeout_ms);
+                            req->error = ETIMEDOUT;
+                            req->done = 1;
+                            *done = 1;
+                            __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+                            __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
+                            free(req);
+                            return ncclSystemError;
+                        }
                         usleep(100);
                         continue;
                     }
@@ -1850,6 +1906,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                     return ncclSystemError;
                 }
                 total_recvd += recvd;
+                timeout_retries = 0;  // Reset timeout on progress
             }
 
             req->size = msg_size;
