@@ -13,7 +13,7 @@ TARGET = libnccl-net.so
 TARGET_MESH = libnccl-net-mesh.so
 
 # Sources
-SRCS = src/mesh_plugin.c
+SRCS = src/mesh_plugin.c src/mesh_routing.c
 OBJS = $(SRCS:.c=.o)
 
 # Default target
