@@ -263,4 +263,275 @@ void mesh_dump_topology(void);
 /* Print NIC classification to log */
 void mesh_dump_nic_classification(void);
 
+/*
+ * =============================================================================
+ * Phase 2: Relay Communication Layer
+ * =============================================================================
+ */
+
+/*
+ * Relay protocol constants
+ */
+#define MESH_RELAY_MAGIC        0x52454C59  /* "RELY" */
+#define MESH_RELAY_MAX_SESSIONS 64          /* Max concurrent relay sessions */
+#define MESH_RELAY_BUFFER_SIZE  (4 * 1024 * 1024)  /* 4MB relay buffer */
+#define MESH_RELAY_QUEUE_SIZE   32          /* Pending relay requests */
+
+/*
+ * Relay message types
+ */
+enum mesh_relay_msg_type {
+    MESH_RELAY_DATA = 1,        /* Data payload to forward */
+    MESH_RELAY_SETUP_REQ,       /* Request to establish relay path */
+    MESH_RELAY_SETUP_ACK,       /* Acknowledge relay path setup */
+    MESH_RELAY_TEARDOWN,        /* Tear down relay session */
+    MESH_RELAY_KEEPALIVE,       /* Keep session alive */
+};
+
+/*
+ * Relay header - prepended to all relayed messages
+ * This header travels with the message through all relay hops
+ */
+struct mesh_relay_header {
+    uint32_t magic;             /* MESH_RELAY_MAGIC */
+    uint32_t session_id;        /* Unique session identifier */
+    uint32_t src_node_id;       /* Original sender node ID */
+    uint32_t dst_node_id;       /* Final destination node ID */
+    uint32_t payload_size;      /* Size of actual data (excluding header) */
+    uint16_t msg_type;          /* enum mesh_relay_msg_type */
+    uint8_t  hop_count;         /* Current hop number (incremented at each relay) */
+    uint8_t  total_hops;        /* Total expected hops */
+    uint8_t  path[MESH_MAX_HOPS]; /* Node indices in path */
+    uint8_t  flags;             /* Reserved for future use */
+    uint8_t  reserved[3];
+};
+
+/*
+ * Relay session state
+ */
+enum mesh_relay_session_state {
+    MESH_RELAY_STATE_IDLE = 0,      /* Session slot not in use */
+    MESH_RELAY_STATE_SETUP,         /* Setting up relay path */
+    MESH_RELAY_STATE_ACTIVE,        /* Session is active */
+    MESH_RELAY_STATE_TEARDOWN,      /* Tearing down */
+    MESH_RELAY_STATE_ERROR,         /* Error state */
+};
+
+/*
+ * Relay session - represents one relay path between non-adjacent nodes
+ *
+ * For the ORIGINATOR (sender):
+ *   - Sends data to first hop (next_hop connection)
+ *   - Receives acknowledgments
+ *
+ * For RELAY NODES (intermediate):
+ *   - Receives from prev_hop, forwards to next_hop
+ *   - Maintains buffer for store-and-forward
+ *
+ * For the DESTINATION (receiver):
+ *   - Receives data from prev_hop
+ *   - Delivers to application
+ */
+struct mesh_relay_session {
+    /* Session identification */
+    uint32_t session_id;            /* Unique session ID */
+    uint32_t src_node_id;           /* Original sender */
+    uint32_t dst_node_id;           /* Final destination */
+    enum mesh_relay_session_state state;
+
+    /* Path information */
+    uint8_t  path[MESH_MAX_HOPS];   /* Full path (node indices) */
+    uint8_t  path_len;              /* Number of hops */
+    uint8_t  my_position;           /* Our position in path (0=src, path_len-1=dst) */
+    uint8_t  reserved[2];
+
+    /* Connections to neighbors in path */
+    void *prev_hop_comm;            /* Receive from previous hop (NULL if we're source) */
+    void *next_hop_comm;            /* Send to next hop (NULL if we're destination) */
+    uint32_t prev_hop_node_id;      /* Previous hop node ID */
+    uint32_t next_hop_node_id;      /* Next hop node ID */
+
+    /* Store-and-forward buffer */
+    void *relay_buffer;             /* Buffer for receiving/forwarding data */
+    size_t buffer_size;             /* Allocated buffer size */
+    size_t data_in_buffer;          /* Current data in buffer */
+
+    /* Statistics */
+    uint64_t bytes_relayed;         /* Total bytes forwarded */
+    uint64_t messages_relayed;      /* Total messages forwarded */
+
+    /* Timing */
+    uint64_t created_time;          /* When session was created */
+    uint64_t last_activity;         /* Last data transfer time */
+};
+
+/*
+ * Relay service state - manages all relay operations
+ */
+struct mesh_relay_state {
+    /* Sessions */
+    struct mesh_relay_session sessions[MESH_RELAY_MAX_SESSIONS];
+    int num_active_sessions;
+    uint32_t next_session_id;       /* Counter for generating session IDs */
+    pthread_mutex_t sessions_mutex;
+
+    /* Relay service thread */
+    pthread_t relay_thread;
+    int thread_running;
+    int thread_stop;
+    pthread_cond_t relay_cond;      /* Signals work available */
+
+    /* Configuration */
+    int relay_enabled;              /* 1 if relay routing is enabled */
+    int max_relay_hops;             /* Maximum allowed relay hops */
+
+    /* Statistics */
+    uint64_t total_bytes_relayed;
+    uint64_t total_messages_relayed;
+    uint64_t relay_errors;
+};
+
+/*
+ * Global relay state
+ */
+extern struct mesh_relay_state g_mesh_relay;
+
+/*
+ * Relay communication handle
+ * Used by mesh_send_comm/mesh_recv_comm for relayed connections
+ */
+struct mesh_relay_comm {
+    int is_relay;                   /* 1 if this is a relay connection */
+    uint32_t session_id;            /* Associated relay session ID */
+    uint32_t peer_node_id;          /* Remote peer's node ID */
+    struct mesh_relay_session *session;  /* Pointer to session */
+
+    /* For the first/last hop, we use a real RDMA connection */
+    void *direct_comm;              /* Underlying direct comm to first/last hop */
+    int is_sender;                  /* 1 if we're the originator, 0 if receiver */
+};
+
+/*
+ * Relay initialization and shutdown
+ */
+
+/* Initialize relay subsystem */
+int mesh_relay_init(void);
+
+/* Shutdown relay subsystem */
+void mesh_relay_destroy(void);
+
+/* Start relay service thread */
+int mesh_relay_service_start(void);
+
+/* Stop relay service thread */
+void mesh_relay_service_stop(void);
+
+/*
+ * Relay session management
+ */
+
+/* Create a new relay session (called by originator) */
+struct mesh_relay_session* mesh_relay_session_create(
+    uint32_t dst_node_id,
+    const struct mesh_route_entry *route);
+
+/* Find existing session by ID */
+struct mesh_relay_session* mesh_relay_session_find(uint32_t session_id);
+
+/* Find session by src/dst pair */
+struct mesh_relay_session* mesh_relay_session_find_by_peers(
+    uint32_t src_node_id,
+    uint32_t dst_node_id);
+
+/* Destroy a relay session */
+void mesh_relay_session_destroy(struct mesh_relay_session *session);
+
+/*
+ * Relay path setup
+ */
+
+/* Set up relay path to destination (blocking) */
+int mesh_relay_setup_path(uint32_t dst_node_id, struct mesh_relay_session **session_out);
+
+/* Handle incoming relay setup request (called by relay service) */
+int mesh_relay_handle_setup_req(const struct mesh_relay_header *hdr,
+                                 void *recv_comm);
+
+/* Handle incoming relay setup acknowledgment */
+int mesh_relay_handle_setup_ack(const struct mesh_relay_header *hdr);
+
+/*
+ * Relay data transfer
+ */
+
+/* Send data through relay path */
+int mesh_relay_send(struct mesh_relay_session *session,
+                    void *data, size_t size,
+                    void **request);
+
+/* Check if relay send completed */
+int mesh_relay_send_test(void *request, int *done, int *size);
+
+/* Receive data from relay path (called at destination) */
+int mesh_relay_recv(struct mesh_relay_session *session,
+                    void *data, size_t size,
+                    void **request);
+
+/* Check if relay receive completed */
+int mesh_relay_recv_test(void *request, int *done, int *size);
+
+/* Forward data to next hop (called by relay service on intermediate nodes) */
+int mesh_relay_forward(struct mesh_relay_session *session,
+                       const struct mesh_relay_header *hdr,
+                       void *data, size_t size);
+
+/*
+ * Relay connection establishment (integrates with mesh_connect)
+ */
+
+/* Check if connection to peer requires relay */
+int mesh_relay_needed(uint32_t peer_node_id);
+
+/* Establish relay connection to non-adjacent peer */
+int mesh_relay_connect(uint32_t peer_node_id, void **relay_comm);
+
+/* Accept relay connection from non-adjacent peer */
+int mesh_relay_accept(void **relay_comm);
+
+/* Close relay connection */
+int mesh_relay_close(void *relay_comm);
+
+/*
+ * Helper functions
+ */
+
+/* Get the next hop node ID for a relay path */
+uint32_t mesh_relay_get_next_hop(const struct mesh_relay_session *session);
+
+/* Get our position in the relay path (0=src, path_len-1=dst) */
+int mesh_relay_get_position(const struct mesh_relay_session *session);
+
+/* Check if we are the source of this relay session */
+int mesh_relay_is_source(const struct mesh_relay_session *session);
+
+/* Check if we are the destination of this relay session */
+int mesh_relay_is_destination(const struct mesh_relay_session *session);
+
+/* Check if we are a relay node (intermediate) */
+int mesh_relay_is_intermediate(const struct mesh_relay_session *session);
+
+/* Generate unique session ID */
+uint32_t mesh_relay_generate_session_id(void);
+
+/*
+ * Relay statistics and diagnostics
+ */
+
+/* Dump relay state to log */
+void mesh_relay_dump_state(void);
+
+/* Dump active sessions to log */
+void mesh_relay_dump_sessions(void);
+
 #endif /* MESH_ROUTING_H */

@@ -2255,6 +2255,12 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
         // Non-fatal - we can still work in direct-connect-only mode
     }
 
+    // Initialize relay subsystem for non-adjacent node communication
+    if (mesh_relay_init() != 0) {
+        MESH_WARN("Relay initialization failed, relay routing disabled");
+        // Non-fatal - we can still work with direct connections only
+    }
+
     g_mesh_state.initialized = 1;
     MESH_INFO("Mesh plugin initialized with %d NICs (RDMA mode)", g_mesh_state.num_nics);
 
