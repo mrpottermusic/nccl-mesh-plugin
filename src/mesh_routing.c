@@ -2015,3 +2015,1106 @@ void mesh_relay_dump_sessions(void) {
 
     pthread_mutex_unlock(&g_mesh_relay.sessions_mutex);
 }
+
+/*
+ * =============================================================================
+ * Phase 3: Ring and Line Topology Optimizations
+ * =============================================================================
+ */
+
+/* Global ring and line state */
+struct mesh_ring_state g_mesh_ring = {0};
+struct mesh_line_state g_mesh_line = {0};
+
+/*
+ * Forward declarations for internal helpers
+ */
+static int ring_find_node_position(uint32_t node_id);
+static int line_find_node_position(uint32_t node_id);
+static int find_adjacent_node(int node_idx, int exclude_idx);
+
+/*
+ * =============================================================================
+ * Ring Topology Functions
+ * =============================================================================
+ */
+
+/*
+ * Initialize ring topology state
+ */
+int mesh_ring_init(void) {
+    memset(&g_mesh_ring, 0, sizeof(g_mesh_ring));
+
+    /* Check if we have a ring topology */
+    if (g_mesh_routing.fast_topology != MESH_TOPO_RING) {
+        MESH_DEBUG("Not a ring topology, skipping ring init");
+        return 0;
+    }
+
+    g_mesh_ring.is_ring = 1;
+    g_mesh_ring.ring_size = g_mesh_routing.num_nodes;
+
+    /* Read configuration */
+    const char *env_val;
+
+    /* NCCL_MESH_RING_LOAD_BALANCE: Enable load balancing (default: 1) */
+    env_val = getenv("NCCL_MESH_RING_LOAD_BALANCE");
+    g_mesh_ring.load_balance_enabled = env_val ? atoi(env_val) : 1;
+
+    /* NCCL_MESH_RING_PREFER_SHORT: Always prefer shorter path (default: 0) */
+    env_val = getenv("NCCL_MESH_RING_PREFER_SHORT");
+    g_mesh_ring.prefer_shorter_path = env_val ? atoi(env_val) : 0;
+
+    /* NCCL_MESH_RING_BALANCE_THRESHOLD: Bytes diff to trigger switch (default: 1MB) */
+    env_val = getenv("NCCL_MESH_RING_BALANCE_THRESHOLD");
+    g_mesh_ring.balance_threshold = env_val ? (uint64_t)atol(env_val) : (1024 * 1024);
+
+    MESH_INFO("Ring init: size=%d, load_balance=%d, prefer_short=%d, threshold=%lu",
+              g_mesh_ring.ring_size, g_mesh_ring.load_balance_enabled,
+              g_mesh_ring.prefer_shorter_path, g_mesh_ring.balance_threshold);
+
+    /* Build ring order */
+    if (mesh_ring_build_order() != 0) {
+        MESH_WARN("Failed to build ring order");
+        return -1;
+    }
+
+    /* Compute dual paths */
+    if (mesh_ring_compute_dual_paths() != 0) {
+        MESH_WARN("Failed to compute dual paths");
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Build ring order from adjacency information
+ * Traverses the ring starting from our node
+ */
+int mesh_ring_build_order(void) {
+    if (!g_mesh_ring.is_ring) {
+        return -1;
+    }
+
+    int num_nodes = g_mesh_routing.num_nodes;
+    if (num_nodes < 3) {
+        MESH_WARN("Ring requires at least 3 nodes, have %d", num_nodes);
+        return -1;
+    }
+
+    /* Find our node index */
+    int local_idx = mesh_get_node_index(g_mesh_routing.local_node_id);
+    if (local_idx < 0) {
+        MESH_WARN("Local node not found in node list");
+        return -1;
+    }
+
+    /* Track visited nodes */
+    int visited[MESH_MAX_NODES] = {0};
+    int order_idx = 0;
+
+    /* Start with our node */
+    int curr = local_idx;
+    visited[curr] = 1;
+    g_mesh_ring.ring_order[order_idx++] = (uint8_t)curr;
+
+    /* Find our two neighbors */
+    int neighbor1 = find_adjacent_node(curr, -1);
+    int neighbor2 = find_adjacent_node(curr, neighbor1);
+
+    if (neighbor1 < 0 || neighbor2 < 0) {
+        MESH_WARN("Could not find two neighbors for ring node %d", curr);
+        return -1;
+    }
+
+    /* Record our neighbors - arbitrarily call neighbor1 CW, neighbor2 CCW */
+    g_mesh_ring.our_position = 0;
+    g_mesh_ring.cw_neighbor_id = g_mesh_routing.nodes[neighbor1].node_id;
+    g_mesh_ring.ccw_neighbor_id = g_mesh_routing.nodes[neighbor2].node_id;
+
+    /* Traverse clockwise (via neighbor1) */
+    curr = neighbor1;
+    while (!visited[curr] && order_idx < num_nodes) {
+        visited[curr] = 1;
+        g_mesh_ring.ring_order[order_idx++] = (uint8_t)curr;
+
+        /* Find next unvisited neighbor */
+        int next1 = find_adjacent_node(curr, -1);
+        int next2 = find_adjacent_node(curr, next1);
+
+        if (next1 >= 0 && !visited[next1]) {
+            curr = next1;
+        } else if (next2 >= 0 && !visited[next2]) {
+            curr = next2;
+        } else {
+            break;  /* No more unvisited neighbors */
+        }
+    }
+
+    if (order_idx != num_nodes) {
+        MESH_WARN("Ring traversal incomplete: got %d nodes, expected %d", order_idx, num_nodes);
+        return -1;
+    }
+
+    g_mesh_ring.ring_order_valid = 1;
+
+    MESH_INFO("Ring order built: us at position 0, CW neighbor=0x%08x, CCW neighbor=0x%08x",
+              g_mesh_ring.cw_neighbor_id, g_mesh_ring.ccw_neighbor_id);
+
+    return 0;
+}
+
+/*
+ * Find an adjacent node (fast lane), optionally excluding one
+ */
+static int find_adjacent_node(int node_idx, int exclude_idx) {
+    if (node_idx < 0 || node_idx >= g_mesh_routing.num_nodes) {
+        return -1;
+    }
+
+    struct mesh_node_identity *node = &g_mesh_routing.nodes[node_idx];
+
+    /* Find nodes that share a fast lane subnet with this node */
+    for (int i = 0; i < g_mesh_routing.num_nodes; i++) {
+        if (i == node_idx || i == exclude_idx) continue;
+
+        struct mesh_node_identity *other = &g_mesh_routing.nodes[i];
+
+        /* Check for shared fast lane subnet */
+        for (int a = 0; a < node->num_fast_addrs; a++) {
+            uint32_t node_ip = ntohl(node->fast_addrs[a].ip);
+            uint32_t node_mask = ntohl(node->fast_addrs[a].mask);
+            uint32_t node_subnet = node_ip & node_mask;
+
+            for (int b = 0; b < other->num_fast_addrs; b++) {
+                uint32_t other_ip = ntohl(other->fast_addrs[b].ip);
+                uint32_t other_mask = ntohl(other->fast_addrs[b].mask);
+                uint32_t other_subnet = other_ip & other_mask;
+
+                if (node_subnet == other_subnet && node_mask == other_mask) {
+                    return i;  /* Found adjacent node */
+                }
+            }
+        }
+    }
+
+    return -1;  /* No adjacent node found */
+}
+
+/*
+ * Find a node's position in the ring order
+ */
+static int ring_find_node_position(uint32_t node_id) {
+    if (!g_mesh_ring.ring_order_valid) {
+        return -1;
+    }
+
+    for (int i = 0; i < g_mesh_ring.ring_size; i++) {
+        int node_idx = g_mesh_ring.ring_order[i];
+        if (node_idx < g_mesh_routing.num_nodes &&
+            g_mesh_routing.nodes[node_idx].node_id == node_id) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+/*
+ * Compute dual paths (CW and CCW) for all destinations in ring
+ */
+int mesh_ring_compute_dual_paths(void) {
+    if (!g_mesh_ring.is_ring || !g_mesh_ring.ring_order_valid) {
+        return -1;
+    }
+
+    int n = g_mesh_ring.ring_size;
+
+    MESH_INFO("Computing dual paths for %d-node ring", n);
+
+    for (int i = 0; i < g_mesh_routing.num_nodes; i++) {
+        struct mesh_ring_dual_path *dp = &g_mesh_ring.dual_paths[i];
+        struct mesh_node_identity *dest = &g_mesh_routing.nodes[i];
+
+        memset(dp, 0, sizeof(*dp));
+        dp->dest_node_id = dest->node_id;
+
+        if (dest->node_id == g_mesh_routing.local_node_id) {
+            /* Path to self - trivial */
+            dp->is_valid = 1;
+            dp->cw_path_len = 0;
+            dp->ccw_path_len = 0;
+            continue;
+        }
+
+        int dest_pos = ring_find_node_position(dest->node_id);
+        if (dest_pos < 0) {
+            MESH_WARN("Destination 0x%08x not found in ring order", dest->node_id);
+            continue;
+        }
+
+        /* Our position is 0 in ring_order */
+        int our_pos = 0;
+
+        /* CW distance: how many hops clockwise */
+        int cw_dist = (dest_pos - our_pos + n) % n;
+
+        /* CCW distance: how many hops counter-clockwise */
+        int ccw_dist = (our_pos - dest_pos + n) % n;
+
+        /* Build CW path */
+        dp->cw_path_len = (uint8_t)cw_dist;
+        for (int j = 0; j < cw_dist && j < MESH_MAX_HOPS; j++) {
+            int pos = (our_pos + j + 1) % n;
+            dp->cw_path[j] = g_mesh_ring.ring_order[pos];
+        }
+
+        /* CW first hop info */
+        if (cw_dist > 0) {
+            int cw_next_idx = g_mesh_ring.ring_order[(our_pos + 1) % n];
+            dp->cw_next_hop_id = g_mesh_routing.nodes[cw_next_idx].node_id;
+
+            /* Find IP and NIC for CW next hop */
+            for (int a = 0; a < g_mesh_routing.num_adjacencies; a++) {
+                if (g_mesh_routing.adjacencies[a].node_id == dp->cw_next_hop_id &&
+                    g_mesh_routing.adjacencies[a].is_fast_adjacent) {
+                    dp->cw_next_hop_nic = g_mesh_routing.adjacencies[a].local_fast_nic_idx;
+
+                    /* Find peer IP on shared subnet */
+                    uint32_t shared = g_mesh_routing.adjacencies[a].shared_fast_subnet;
+                    struct mesh_node_identity *next = &g_mesh_routing.nodes[cw_next_idx];
+                    for (int b = 0; b < next->num_fast_addrs; b++) {
+                        uint32_t peer_ip = ntohl(next->fast_addrs[b].ip);
+                        uint32_t peer_mask = ntohl(next->fast_addrs[b].mask);
+                        if ((peer_ip & peer_mask) == shared) {
+                            dp->cw_next_hop_ip = peer_ip;
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        /* Build CCW path */
+        dp->ccw_path_len = (uint8_t)ccw_dist;
+        for (int j = 0; j < ccw_dist && j < MESH_MAX_HOPS; j++) {
+            int pos = (our_pos - j - 1 + n) % n;
+            dp->ccw_path[j] = g_mesh_ring.ring_order[pos];
+        }
+
+        /* CCW first hop info */
+        if (ccw_dist > 0) {
+            int ccw_next_idx = g_mesh_ring.ring_order[(our_pos - 1 + n) % n];
+            dp->ccw_next_hop_id = g_mesh_routing.nodes[ccw_next_idx].node_id;
+
+            /* Find IP and NIC for CCW next hop */
+            for (int a = 0; a < g_mesh_routing.num_adjacencies; a++) {
+                if (g_mesh_routing.adjacencies[a].node_id == dp->ccw_next_hop_id &&
+                    g_mesh_routing.adjacencies[a].is_fast_adjacent) {
+                    dp->ccw_next_hop_nic = g_mesh_routing.adjacencies[a].local_fast_nic_idx;
+
+                    /* Find peer IP on shared subnet */
+                    uint32_t shared = g_mesh_routing.adjacencies[a].shared_fast_subnet;
+                    struct mesh_node_identity *next = &g_mesh_routing.nodes[ccw_next_idx];
+                    for (int b = 0; b < next->num_fast_addrs; b++) {
+                        uint32_t peer_ip = ntohl(next->fast_addrs[b].ip);
+                        uint32_t peer_mask = ntohl(next->fast_addrs[b].mask);
+                        if ((peer_ip & peer_mask) == shared) {
+                            dp->ccw_next_hop_ip = peer_ip;
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        /* Set initial preferred direction to shorter path */
+        if (cw_dist <= ccw_dist) {
+            dp->preferred = MESH_RING_DIR_CW;
+        } else {
+            dp->preferred = MESH_RING_DIR_CCW;
+        }
+
+        dp->is_valid = 1;
+
+        MESH_DEBUG("Dual path to 0x%08x: CW=%d hops, CCW=%d hops, preferred=%s",
+                   dest->node_id, cw_dist, ccw_dist,
+                   dp->preferred == MESH_RING_DIR_CW ? "CW" : "CCW");
+    }
+
+    return 0;
+}
+
+/*
+ * Get the shorter path direction to a destination
+ */
+enum mesh_ring_direction mesh_ring_get_shorter_direction(uint32_t dest_node_id) {
+    struct mesh_ring_dual_path *dp = mesh_ring_get_dual_path(dest_node_id);
+    if (!dp || !dp->is_valid) {
+        return MESH_RING_DIR_NONE;
+    }
+
+    if (dp->cw_path_len <= dp->ccw_path_len) {
+        return MESH_RING_DIR_CW;
+    }
+    return MESH_RING_DIR_CCW;
+}
+
+/*
+ * Get the next hop for a given direction
+ */
+uint32_t mesh_ring_get_next_hop(enum mesh_ring_direction direction) {
+    if (!g_mesh_ring.is_ring) {
+        return 0;
+    }
+
+    switch (direction) {
+        case MESH_RING_DIR_CW:
+            return g_mesh_ring.cw_neighbor_id;
+        case MESH_RING_DIR_CCW:
+            return g_mesh_ring.ccw_neighbor_id;
+        default:
+            return 0;
+    }
+}
+
+/*
+ * Select path based on load balancing
+ */
+enum mesh_ring_direction mesh_ring_select_path(uint32_t dest_node_id, size_t msg_size) {
+    struct mesh_ring_dual_path *dp = mesh_ring_get_dual_path(dest_node_id);
+    if (!dp || !dp->is_valid) {
+        return MESH_RING_DIR_NONE;
+    }
+
+    /* Trivial case: path to self */
+    if (dp->cw_path_len == 0 && dp->ccw_path_len == 0) {
+        return MESH_RING_DIR_NONE;
+    }
+
+    /* If one path is direct (1 hop) and other is not, prefer direct */
+    if (dp->cw_path_len == 1 && dp->ccw_path_len > 1) {
+        return MESH_RING_DIR_CW;
+    }
+    if (dp->ccw_path_len == 1 && dp->cw_path_len > 1) {
+        return MESH_RING_DIR_CCW;
+    }
+
+    /* If prefer_shorter_path is set, always use shorter */
+    if (g_mesh_ring.prefer_shorter_path) {
+        return mesh_ring_get_shorter_direction(dest_node_id);
+    }
+
+    /* If load balancing is disabled, use preferred (shorter) path */
+    if (!g_mesh_ring.load_balance_enabled) {
+        return dp->preferred;
+    }
+
+    /* Load balancing: check if paths have similar length */
+    if (dp->cw_path_len != dp->ccw_path_len) {
+        /* Unequal paths - prefer shorter unless load is very unbalanced */
+        enum mesh_ring_direction shorter = mesh_ring_get_shorter_direction(dest_node_id);
+        uint64_t shorter_bytes = (shorter == MESH_RING_DIR_CW) ?
+                                  dp->cw_bytes_sent : dp->ccw_bytes_sent;
+        uint64_t longer_bytes = (shorter == MESH_RING_DIR_CW) ?
+                                 dp->ccw_bytes_sent : dp->cw_bytes_sent;
+
+        /* Use longer path only if shorter is very congested */
+        if (shorter_bytes > longer_bytes + g_mesh_ring.balance_threshold * 2) {
+            return (shorter == MESH_RING_DIR_CW) ? MESH_RING_DIR_CCW : MESH_RING_DIR_CW;
+        }
+        return shorter;
+    }
+
+    /* Equal length paths - balance load */
+    (void)msg_size;  /* Could use message size for weighted decisions */
+
+    if (dp->cw_bytes_sent <= dp->ccw_bytes_sent) {
+        if (dp->ccw_bytes_sent - dp->cw_bytes_sent > g_mesh_ring.balance_threshold) {
+            return MESH_RING_DIR_CW;
+        }
+    } else {
+        if (dp->cw_bytes_sent - dp->ccw_bytes_sent > g_mesh_ring.balance_threshold) {
+            return MESH_RING_DIR_CCW;
+        }
+    }
+
+    /* Use current preferred direction */
+    return dp->preferred;
+}
+
+/*
+ * Get dual path entry for a destination
+ */
+struct mesh_ring_dual_path* mesh_ring_get_dual_path(uint32_t dest_node_id) {
+    if (!g_mesh_ring.is_ring) {
+        return NULL;
+    }
+
+    for (int i = 0; i < g_mesh_routing.num_nodes; i++) {
+        if (g_mesh_ring.dual_paths[i].dest_node_id == dest_node_id) {
+            return &g_mesh_ring.dual_paths[i];
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * Update path statistics after sending
+ */
+void mesh_ring_update_stats(uint32_t dest_node_id, enum mesh_ring_direction dir, size_t bytes) {
+    struct mesh_ring_dual_path *dp = mesh_ring_get_dual_path(dest_node_id);
+    if (!dp || !dp->is_valid) {
+        return;
+    }
+
+    switch (dir) {
+        case MESH_RING_DIR_CW:
+            dp->cw_bytes_sent += bytes;
+            break;
+        case MESH_RING_DIR_CCW:
+            dp->ccw_bytes_sent += bytes;
+            break;
+        default:
+            break;
+    }
+
+    /* Update preferred direction based on load balance */
+    if (g_mesh_ring.load_balance_enabled && dp->cw_path_len == dp->ccw_path_len) {
+        if (dp->cw_bytes_sent < dp->ccw_bytes_sent) {
+            dp->preferred = MESH_RING_DIR_CW;
+        } else {
+            dp->preferred = MESH_RING_DIR_CCW;
+        }
+    }
+}
+
+/*
+ * Get ring hop count in a direction
+ */
+int mesh_ring_hop_count(uint32_t dest_node_id, enum mesh_ring_direction direction) {
+    struct mesh_ring_dual_path *dp = mesh_ring_get_dual_path(dest_node_id);
+    if (!dp || !dp->is_valid) {
+        return -1;
+    }
+
+    switch (direction) {
+        case MESH_RING_DIR_CW:
+            return dp->cw_path_len;
+        case MESH_RING_DIR_CCW:
+            return dp->ccw_path_len;
+        default:
+            return -1;
+    }
+}
+
+/*
+ * Check if we're a ring neighbor of a node
+ */
+int mesh_ring_is_neighbor(uint32_t node_id) {
+    if (!g_mesh_ring.is_ring) {
+        return 0;
+    }
+    return (node_id == g_mesh_ring.cw_neighbor_id ||
+            node_id == g_mesh_ring.ccw_neighbor_id);
+}
+
+/*
+ * Dump ring state to log
+ */
+void mesh_ring_dump_state(void) {
+    MESH_INFO("=== Ring Topology State ===");
+    MESH_INFO("  Is ring: %d", g_mesh_ring.is_ring);
+
+    if (!g_mesh_ring.is_ring) {
+        return;
+    }
+
+    MESH_INFO("  Ring size: %d", g_mesh_ring.ring_size);
+    MESH_INFO("  Our position: %d", g_mesh_ring.our_position);
+    MESH_INFO("  CW neighbor: 0x%08x", g_mesh_ring.cw_neighbor_id);
+    MESH_INFO("  CCW neighbor: 0x%08x", g_mesh_ring.ccw_neighbor_id);
+    MESH_INFO("  Load balance: %d (threshold=%lu)",
+              g_mesh_ring.load_balance_enabled, g_mesh_ring.balance_threshold);
+    MESH_INFO("  Prefer shorter: %d", g_mesh_ring.prefer_shorter_path);
+
+    MESH_INFO("  Ring order (%s):", g_mesh_ring.ring_order_valid ? "valid" : "invalid");
+    if (g_mesh_ring.ring_order_valid) {
+        for (int i = 0; i < g_mesh_ring.ring_size; i++) {
+            int idx = g_mesh_ring.ring_order[i];
+            MESH_INFO("    [%d] Node %d: 0x%08x", i, idx,
+                      g_mesh_routing.nodes[idx].node_id);
+        }
+    }
+
+    MESH_INFO("  Dual paths:");
+    for (int i = 0; i < g_mesh_routing.num_nodes; i++) {
+        struct mesh_ring_dual_path *dp = &g_mesh_ring.dual_paths[i];
+        if (!dp->is_valid) continue;
+        if (dp->dest_node_id == g_mesh_routing.local_node_id) continue;
+
+        MESH_INFO("    -> 0x%08x: CW=%d hops (%lu B), CCW=%d hops (%lu B), pref=%s",
+                  dp->dest_node_id, dp->cw_path_len, dp->cw_bytes_sent,
+                  dp->ccw_path_len, dp->ccw_bytes_sent,
+                  dp->preferred == MESH_RING_DIR_CW ? "CW" : "CCW");
+    }
+}
+
+/*
+ * =============================================================================
+ * Line Topology Functions
+ * =============================================================================
+ */
+
+/*
+ * Find a node's position in the line order
+ */
+static int line_find_node_position(uint32_t node_id) {
+    if (!g_mesh_line.line_order_valid) {
+        return -1;
+    }
+
+    for (int i = 0; i < g_mesh_line.line_length; i++) {
+        int node_idx = g_mesh_line.line_order[i];
+        if (node_idx < g_mesh_routing.num_nodes &&
+            g_mesh_routing.nodes[node_idx].node_id == node_id) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+/*
+ * Initialize line topology state
+ */
+int mesh_line_init(void) {
+    memset(&g_mesh_line, 0, sizeof(g_mesh_line));
+
+    /* Check if we have a line topology */
+    if (g_mesh_routing.fast_topology != MESH_TOPO_LINE) {
+        MESH_DEBUG("Not a line topology, skipping line init");
+        return 0;
+    }
+
+    g_mesh_line.is_line = 1;
+    g_mesh_line.line_length = g_mesh_routing.num_nodes;
+
+    MESH_INFO("Line init: length=%d", g_mesh_line.line_length);
+
+    /* Detect endpoints first */
+    if (mesh_line_detect_endpoints() != 0) {
+        MESH_WARN("Failed to detect line endpoints");
+        return -1;
+    }
+
+    /* Build line order */
+    if (mesh_line_build_order() != 0) {
+        MESH_WARN("Failed to build line order");
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Detect and record line endpoints
+ * Endpoints are nodes with exactly 1 fast lane neighbor
+ */
+int mesh_line_detect_endpoints(void) {
+    if (!g_mesh_line.is_line) {
+        return -1;
+    }
+
+    int endpoints_found = 0;
+    memset(&g_mesh_line.head, 0, sizeof(g_mesh_line.head));
+    memset(&g_mesh_line.tail, 0, sizeof(g_mesh_line.tail));
+
+    for (int i = 0; i < g_mesh_routing.num_nodes; i++) {
+        /* Count fast lane neighbors */
+        int neighbor1 = find_adjacent_node(i, -1);
+        int neighbor2 = find_adjacent_node(i, neighbor1);
+
+        if (neighbor1 >= 0 && neighbor2 < 0) {
+            /* Exactly one neighbor - this is an endpoint */
+            struct mesh_line_endpoint *ep;
+
+            if (endpoints_found == 0) {
+                ep = &g_mesh_line.head;
+                ep->is_head = 1;
+                ep->is_tail = 0;
+            } else if (endpoints_found == 1) {
+                ep = &g_mesh_line.tail;
+                ep->is_head = 0;
+                ep->is_tail = 1;
+            } else {
+                MESH_WARN("Line has more than 2 endpoints!");
+                return -1;
+            }
+
+            ep->node_id = g_mesh_routing.nodes[i].node_id;
+            ep->node_idx = i;
+            ep->neighbor_id = g_mesh_routing.nodes[neighbor1].node_id;
+
+            MESH_INFO("Found %s endpoint: node 0x%08x (idx %d), neighbor=0x%08x",
+                      ep->is_head ? "head" : "tail", ep->node_id, ep->node_idx,
+                      ep->neighbor_id);
+
+            endpoints_found++;
+        }
+    }
+
+    if (endpoints_found != 2) {
+        MESH_WARN("Line topology requires exactly 2 endpoints, found %d", endpoints_found);
+        return -1;
+    }
+
+    /* Check if we are an endpoint */
+    if (g_mesh_line.head.node_id == g_mesh_routing.local_node_id ||
+        g_mesh_line.tail.node_id == g_mesh_routing.local_node_id) {
+        g_mesh_line.is_endpoint = 1;
+        MESH_INFO("We are a line endpoint");
+    }
+
+    return 0;
+}
+
+/*
+ * Build line order from head to tail
+ */
+int mesh_line_build_order(void) {
+    if (!g_mesh_line.is_line) {
+        return -1;
+    }
+
+    int num_nodes = g_mesh_routing.num_nodes;
+    if (num_nodes < 2) {
+        MESH_WARN("Line requires at least 2 nodes, have %d", num_nodes);
+        return -1;
+    }
+
+    /* Track visited nodes */
+    int visited[MESH_MAX_NODES] = {0};
+    int order_idx = 0;
+
+    /* Start from head endpoint */
+    int curr = g_mesh_line.head.node_idx;
+    visited[curr] = 1;
+    g_mesh_line.line_order[order_idx++] = (uint8_t)curr;
+
+    /* Traverse to tail */
+    while (order_idx < num_nodes) {
+        /* Find unvisited neighbor */
+        int next1 = find_adjacent_node(curr, -1);
+        int next2 = find_adjacent_node(curr, next1);
+
+        int next = -1;
+        if (next1 >= 0 && !visited[next1]) {
+            next = next1;
+        } else if (next2 >= 0 && !visited[next2]) {
+            next = next2;
+        }
+
+        if (next < 0) {
+            break;  /* No more unvisited neighbors */
+        }
+
+        visited[next] = 1;
+        g_mesh_line.line_order[order_idx++] = (uint8_t)next;
+        curr = next;
+    }
+
+    if (order_idx != num_nodes) {
+        MESH_WARN("Line traversal incomplete: got %d nodes, expected %d", order_idx, num_nodes);
+        return -1;
+    }
+
+    /* Verify last node is tail endpoint */
+    if (g_mesh_routing.nodes[curr].node_id != g_mesh_line.tail.node_id) {
+        MESH_WARN("Line traversal did not reach tail endpoint");
+        /* Swap head and tail if we went the wrong way */
+        struct mesh_line_endpoint temp = g_mesh_line.head;
+        g_mesh_line.head = g_mesh_line.tail;
+        g_mesh_line.tail = temp;
+        g_mesh_line.head.is_head = 1;
+        g_mesh_line.head.is_tail = 0;
+        g_mesh_line.tail.is_head = 0;
+        g_mesh_line.tail.is_tail = 1;
+    }
+
+    g_mesh_line.line_order_valid = 1;
+
+    /* Find our position */
+    g_mesh_line.our_position = line_find_node_position(g_mesh_routing.local_node_id);
+
+    /* Set up our neighbors */
+    if (g_mesh_line.our_position > 0) {
+        int left_idx = g_mesh_line.line_order[g_mesh_line.our_position - 1];
+        g_mesh_line.left_neighbor_id = g_mesh_routing.nodes[left_idx].node_id;
+    }
+    if (g_mesh_line.our_position < g_mesh_line.line_length - 1) {
+        int right_idx = g_mesh_line.line_order[g_mesh_line.our_position + 1];
+        g_mesh_line.right_neighbor_id = g_mesh_routing.nodes[right_idx].node_id;
+    }
+
+    MESH_INFO("Line order built: our position=%d, left=0x%08x, right=0x%08x",
+              g_mesh_line.our_position, g_mesh_line.left_neighbor_id, g_mesh_line.right_neighbor_id);
+
+    return 0;
+}
+
+/*
+ * Check if we are a line endpoint
+ */
+int mesh_line_is_endpoint(void) {
+    return g_mesh_line.is_line && g_mesh_line.is_endpoint;
+}
+
+/*
+ * Check if a node is a line endpoint
+ */
+int mesh_line_node_is_endpoint(uint32_t node_id) {
+    if (!g_mesh_line.is_line) {
+        return 0;
+    }
+    return (node_id == g_mesh_line.head.node_id ||
+            node_id == g_mesh_line.tail.node_id);
+}
+
+/*
+ * Get direction to destination (towards head or tail)
+ * Returns: -1 = towards head, 1 = towards tail, 0 = error/self
+ */
+int mesh_line_get_direction(uint32_t dest_node_id) {
+    if (!g_mesh_line.is_line || !g_mesh_line.line_order_valid) {
+        return 0;
+    }
+
+    int dest_pos = line_find_node_position(dest_node_id);
+    if (dest_pos < 0) {
+        return 0;
+    }
+
+    if (dest_pos < g_mesh_line.our_position) {
+        return -1;  /* Towards head */
+    } else if (dest_pos > g_mesh_line.our_position) {
+        return 1;   /* Towards tail */
+    }
+
+    return 0;  /* Self or error */
+}
+
+/*
+ * Get hop count to destination
+ */
+int mesh_line_hop_count(uint32_t dest_node_id) {
+    if (!g_mesh_line.is_line || !g_mesh_line.line_order_valid) {
+        return -1;
+    }
+
+    int dest_pos = line_find_node_position(dest_node_id);
+    if (dest_pos < 0) {
+        return -1;
+    }
+
+    int diff = dest_pos - g_mesh_line.our_position;
+    return (diff >= 0) ? diff : -diff;
+}
+
+/*
+ * Get next hop towards a destination
+ */
+uint32_t mesh_line_get_next_hop(uint32_t dest_node_id) {
+    if (!g_mesh_line.is_line || !g_mesh_line.line_order_valid) {
+        return 0;
+    }
+
+    int direction = mesh_line_get_direction(dest_node_id);
+
+    if (direction < 0) {
+        /* Towards head */
+        return g_mesh_line.left_neighbor_id;
+    } else if (direction > 0) {
+        /* Towards tail */
+        return g_mesh_line.right_neighbor_id;
+    }
+
+    return 0;  /* Self or error */
+}
+
+/*
+ * Check if we're between two nodes (for relay decisions)
+ * Returns 1 if we are on the path between src and dst
+ */
+int mesh_line_is_between(uint32_t src_node_id, uint32_t dst_node_id) {
+    if (!g_mesh_line.is_line || !g_mesh_line.line_order_valid) {
+        return 0;
+    }
+
+    int src_pos = line_find_node_position(src_node_id);
+    int dst_pos = line_find_node_position(dst_node_id);
+
+    if (src_pos < 0 || dst_pos < 0) {
+        return 0;
+    }
+
+    int our_pos = g_mesh_line.our_position;
+
+    /* We're between if our position is strictly between src and dst */
+    if (src_pos < dst_pos) {
+        return (our_pos > src_pos && our_pos < dst_pos);
+    } else {
+        return (our_pos > dst_pos && our_pos < src_pos);
+    }
+}
+
+/*
+ * Dump line state to log
+ */
+void mesh_line_dump_state(void) {
+    MESH_INFO("=== Line Topology State ===");
+    MESH_INFO("  Is line: %d", g_mesh_line.is_line);
+
+    if (!g_mesh_line.is_line) {
+        return;
+    }
+
+    MESH_INFO("  Line length: %d", g_mesh_line.line_length);
+    MESH_INFO("  Head endpoint: 0x%08x (idx %d)", g_mesh_line.head.node_id, g_mesh_line.head.node_idx);
+    MESH_INFO("  Tail endpoint: 0x%08x (idx %d)", g_mesh_line.tail.node_id, g_mesh_line.tail.node_idx);
+    MESH_INFO("  Our position: %d (is_endpoint=%d)", g_mesh_line.our_position, g_mesh_line.is_endpoint);
+    MESH_INFO("  Left neighbor: 0x%08x", g_mesh_line.left_neighbor_id);
+    MESH_INFO("  Right neighbor: 0x%08x", g_mesh_line.right_neighbor_id);
+
+    MESH_INFO("  Line order (%s):", g_mesh_line.line_order_valid ? "valid" : "invalid");
+    if (g_mesh_line.line_order_valid) {
+        for (int i = 0; i < g_mesh_line.line_length; i++) {
+            int idx = g_mesh_line.line_order[i];
+            const char *marker = "";
+            if (g_mesh_routing.nodes[idx].node_id == g_mesh_line.head.node_id) {
+                marker = " [HEAD]";
+            } else if (g_mesh_routing.nodes[idx].node_id == g_mesh_line.tail.node_id) {
+                marker = " [TAIL]";
+            } else if (g_mesh_routing.nodes[idx].node_id == g_mesh_routing.local_node_id) {
+                marker = " [US]";
+            }
+            MESH_INFO("    [%d] Node %d: 0x%08x%s", i, idx,
+                      g_mesh_routing.nodes[idx].node_id, marker);
+        }
+    }
+}
+
+/*
+ * =============================================================================
+ * Topology-Aware Routing Optimization
+ * =============================================================================
+ */
+
+/*
+ * Initialize topology-specific optimizations
+ * Should be called after mesh_build_routing_table() and mesh_detect_topology()
+ */
+int mesh_topo_optimize_init(void) {
+    int ret = 0;
+
+    MESH_INFO("Initializing topology-specific optimizations");
+
+    switch (g_mesh_routing.fast_topology) {
+        case MESH_TOPO_RING:
+            ret = mesh_ring_init();
+            if (ret == 0) {
+                mesh_ring_dump_state();
+            }
+            break;
+
+        case MESH_TOPO_LINE:
+            ret = mesh_line_init();
+            if (ret == 0) {
+                mesh_line_dump_state();
+            }
+            break;
+
+        case MESH_TOPO_FULL_MESH:
+            MESH_INFO("Full mesh topology - no additional optimizations needed");
+            break;
+
+        default:
+            MESH_INFO("Generic topology - using standard BFS routing");
+            break;
+    }
+
+    return ret;
+}
+
+/*
+ * Get optimized route considering topology
+ * Enhances the base route with topology-specific information
+ */
+int mesh_topo_get_optimized_route(uint32_t dest_node_id, struct mesh_route_entry *route) {
+    if (!route) {
+        return -1;
+    }
+
+    /* Start with base route */
+    if (mesh_get_route(dest_node_id, route) != 0) {
+        return -1;
+    }
+
+    /* Apply topology-specific optimizations */
+    switch (g_mesh_routing.fast_topology) {
+        case MESH_TOPO_RING:
+            if (g_mesh_ring.is_ring && !route->is_direct) {
+                /* For ring, select path based on load balancing */
+                enum mesh_ring_direction dir = mesh_ring_select_path(dest_node_id, 0);
+                struct mesh_ring_dual_path *dp = mesh_ring_get_dual_path(dest_node_id);
+
+                if (dp && dp->is_valid && dir != MESH_RING_DIR_NONE) {
+                    /* Update route with selected path */
+                    if (dir == MESH_RING_DIR_CW) {
+                        route->next_hop_node_id = dp->cw_next_hop_id;
+                        route->next_hop_ip = dp->cw_next_hop_ip;
+                        route->next_hop_nic_idx = dp->cw_next_hop_nic;
+                        route->num_hops = dp->cw_path_len;
+                    } else {
+                        route->next_hop_node_id = dp->ccw_next_hop_id;
+                        route->next_hop_ip = dp->ccw_next_hop_ip;
+                        route->next_hop_nic_idx = dp->ccw_next_hop_nic;
+                        route->num_hops = dp->ccw_path_len;
+                    }
+
+                    MESH_DEBUG("Ring optimized route to 0x%08x: %s path, %d hops",
+                               dest_node_id, dir == MESH_RING_DIR_CW ? "CW" : "CCW",
+                               route->num_hops);
+                }
+            }
+            break;
+
+        case MESH_TOPO_LINE:
+            if (g_mesh_line.is_line) {
+                /* For line, use direction-based routing */
+                uint32_t next_hop = mesh_line_get_next_hop(dest_node_id);
+                if (next_hop != 0) {
+                    route->next_hop_node_id = next_hop;
+                    route->num_hops = mesh_line_hop_count(dest_node_id);
+
+                    MESH_DEBUG("Line optimized route to 0x%08x: direction=%d, %d hops",
+                               dest_node_id, mesh_line_get_direction(dest_node_id),
+                               route->num_hops);
+                }
+            }
+            break;
+
+        default:
+            /* Use base route as-is */
+            break;
+    }
+
+    return 0;
+}
+
+/*
+ * Select best path for a message (considers load balancing for ring)
+ * Returns the next hop information for sending
+ */
+int mesh_topo_select_path(uint32_t dest_node_id, size_t msg_size,
+                          uint32_t *next_hop_id, uint32_t *next_hop_ip) {
+    if (!next_hop_id || !next_hop_ip) {
+        return -1;
+    }
+
+    *next_hop_id = 0;
+    *next_hop_ip = 0;
+
+    /* Check if destination is directly reachable */
+    if (mesh_has_direct_route(dest_node_id)) {
+        struct mesh_route_entry route;
+        if (mesh_get_route(dest_node_id, &route) == 0) {
+            *next_hop_id = dest_node_id;
+            *next_hop_ip = route.direct_ip;
+            return 0;
+        }
+    }
+
+    /* Apply topology-specific path selection */
+    switch (g_mesh_routing.fast_topology) {
+        case MESH_TOPO_RING:
+            if (g_mesh_ring.is_ring) {
+                enum mesh_ring_direction dir = mesh_ring_select_path(dest_node_id, msg_size);
+                struct mesh_ring_dual_path *dp = mesh_ring_get_dual_path(dest_node_id);
+
+                if (dp && dp->is_valid && dir != MESH_RING_DIR_NONE) {
+                    if (dir == MESH_RING_DIR_CW) {
+                        *next_hop_id = dp->cw_next_hop_id;
+                        *next_hop_ip = dp->cw_next_hop_ip;
+                    } else {
+                        *next_hop_id = dp->ccw_next_hop_id;
+                        *next_hop_ip = dp->ccw_next_hop_ip;
+                    }
+
+                    /* Update statistics for load balancing */
+                    mesh_ring_update_stats(dest_node_id, dir, msg_size);
+
+                    MESH_DEBUG("Ring path selected: dest=0x%08x, dir=%s, next_hop=0x%08x",
+                               dest_node_id, dir == MESH_RING_DIR_CW ? "CW" : "CCW",
+                               *next_hop_id);
+                    return 0;
+                }
+            }
+            break;
+
+        case MESH_TOPO_LINE:
+            if (g_mesh_line.is_line) {
+                *next_hop_id = mesh_line_get_next_hop(dest_node_id);
+                if (*next_hop_id != 0) {
+                    /* Find IP for next hop from adjacencies */
+                    for (int i = 0; i < g_mesh_routing.num_adjacencies; i++) {
+                        if (g_mesh_routing.adjacencies[i].node_id == *next_hop_id &&
+                            g_mesh_routing.adjacencies[i].is_fast_adjacent) {
+                            uint32_t shared = g_mesh_routing.adjacencies[i].shared_fast_subnet;
+                            int next_idx = mesh_get_node_index(*next_hop_id);
+                            if (next_idx >= 0) {
+                                struct mesh_node_identity *next = &g_mesh_routing.nodes[next_idx];
+                                for (int a = 0; a < next->num_fast_addrs; a++) {
+                                    uint32_t peer_ip = ntohl(next->fast_addrs[a].ip);
+                                    uint32_t peer_mask = ntohl(next->fast_addrs[a].mask);
+                                    if ((peer_ip & peer_mask) == shared) {
+                                        *next_hop_ip = peer_ip;
+                                        break;
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+
+                    MESH_DEBUG("Line path selected: dest=0x%08x, next_hop=0x%08x",
+                               dest_node_id, *next_hop_id);
+                    return 0;
+                }
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    /* Fall back to standard routing */
+    struct mesh_route_entry route;
+    if (mesh_get_route(dest_node_id, &route) == 0 && route.reachable) {
+        if (route.is_direct) {
+            *next_hop_id = dest_node_id;
+            *next_hop_ip = route.direct_ip;
+        } else {
+            *next_hop_id = route.next_hop_node_id;
+            *next_hop_ip = route.next_hop_ip;
+        }
+        return 0;
+    }
+
+    MESH_WARN("No path to destination 0x%08x", dest_node_id);
+    return -1;
+}

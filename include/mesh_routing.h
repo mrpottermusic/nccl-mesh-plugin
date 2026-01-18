@@ -534,4 +534,197 @@ void mesh_relay_dump_state(void);
 /* Dump active sessions to log */
 void mesh_relay_dump_sessions(void);
 
+/*
+ * =============================================================================
+ * Phase 3: Ring and Line Topology Optimizations
+ * =============================================================================
+ */
+
+/*
+ * Ring topology direction
+ */
+enum mesh_ring_direction {
+    MESH_RING_DIR_NONE = 0,     /* Not applicable (not a ring) */
+    MESH_RING_DIR_CW,           /* Clockwise direction */
+    MESH_RING_DIR_CCW,          /* Counter-clockwise direction */
+};
+
+/*
+ * Ring dual-path entry - stores both paths to a destination in ring topology
+ */
+struct mesh_ring_dual_path {
+    uint32_t dest_node_id;          /* Destination node ID */
+    int is_valid;                   /* 1 if dual paths are computed */
+
+    /* Clockwise path */
+    uint8_t  cw_path[MESH_MAX_HOPS];    /* Node indices in CW path */
+    uint8_t  cw_path_len;               /* Length of CW path */
+    uint32_t cw_next_hop_id;            /* First hop node ID (CW) */
+    uint32_t cw_next_hop_ip;            /* First hop IP (CW) */
+    uint8_t  cw_next_hop_nic;           /* NIC index for CW direction */
+
+    /* Counter-clockwise path */
+    uint8_t  ccw_path[MESH_MAX_HOPS];   /* Node indices in CCW path */
+    uint8_t  ccw_path_len;              /* Length of CCW path */
+    uint32_t ccw_next_hop_id;           /* First hop node ID (CCW) */
+    uint32_t ccw_next_hop_ip;           /* First hop IP (CCW) */
+    uint8_t  ccw_next_hop_nic;          /* NIC index for CCW direction */
+
+    /* Load balancing state */
+    uint64_t cw_bytes_sent;             /* Bytes sent via CW path */
+    uint64_t ccw_bytes_sent;            /* Bytes sent via CCW path */
+    enum mesh_ring_direction preferred; /* Currently preferred direction */
+};
+
+/*
+ * Line topology endpoint info
+ */
+struct mesh_line_endpoint {
+    uint32_t node_id;               /* Node ID of endpoint */
+    int node_idx;                   /* Index in nodes array */
+    int is_head;                    /* 1 if this is the "head" endpoint */
+    int is_tail;                    /* 1 if this is the "tail" endpoint */
+    uint32_t neighbor_id;           /* Single neighbor's node ID */
+};
+
+/*
+ * Ring topology state - manages ring-specific routing optimizations
+ */
+struct mesh_ring_state {
+    int is_ring;                        /* 1 if topology is ring */
+    int ring_size;                      /* Number of nodes in ring */
+
+    /* Ring order (node indices in order around the ring) */
+    uint8_t ring_order[MESH_MAX_NODES];
+    int ring_order_valid;
+
+    /* Our position in the ring */
+    int our_position;                   /* Our index in ring_order */
+    uint32_t cw_neighbor_id;            /* Clockwise neighbor node ID */
+    uint32_t ccw_neighbor_id;           /* Counter-clockwise neighbor node ID */
+
+    /* Dual-path routing table for ring */
+    struct mesh_ring_dual_path dual_paths[MESH_MAX_NODES];
+
+    /* Load balancing configuration */
+    int load_balance_enabled;           /* 1 to enable load balancing */
+    int prefer_shorter_path;            /* 1 to always prefer shorter path */
+    uint64_t balance_threshold;         /* Bytes difference before switching */
+};
+
+/*
+ * Line topology state - manages line-specific routing optimizations
+ */
+struct mesh_line_state {
+    int is_line;                        /* 1 if topology is line */
+    int line_length;                    /* Number of nodes in line */
+
+    /* Line order (node indices in order along the line) */
+    uint8_t line_order[MESH_MAX_NODES];
+    int line_order_valid;
+
+    /* Endpoints */
+    struct mesh_line_endpoint head;     /* First endpoint */
+    struct mesh_line_endpoint tail;     /* Last endpoint */
+
+    /* Our position in the line */
+    int our_position;                   /* Our index in line_order */
+    int is_endpoint;                    /* 1 if we are an endpoint */
+
+    /* Neighbors (1 if endpoint, 2 otherwise) */
+    uint32_t left_neighbor_id;          /* Neighbor towards head (0 if we're head) */
+    uint32_t right_neighbor_id;         /* Neighbor towards tail (0 if we're tail) */
+};
+
+/*
+ * Extended routing state for topology optimizations
+ */
+extern struct mesh_ring_state g_mesh_ring;
+extern struct mesh_line_state g_mesh_line;
+
+/*
+ * Ring topology functions
+ */
+
+/* Initialize ring topology state */
+int mesh_ring_init(void);
+
+/* Build ring order from adjacency information */
+int mesh_ring_build_order(void);
+
+/* Compute dual paths for all destinations in ring */
+int mesh_ring_compute_dual_paths(void);
+
+/* Get the shorter path direction to a destination */
+enum mesh_ring_direction mesh_ring_get_shorter_direction(uint32_t dest_node_id);
+
+/* Get the next hop for a given direction */
+uint32_t mesh_ring_get_next_hop(enum mesh_ring_direction direction);
+
+/* Select path based on load balancing */
+enum mesh_ring_direction mesh_ring_select_path(uint32_t dest_node_id, size_t msg_size);
+
+/* Get dual path entry for a destination */
+struct mesh_ring_dual_path* mesh_ring_get_dual_path(uint32_t dest_node_id);
+
+/* Update path statistics after sending */
+void mesh_ring_update_stats(uint32_t dest_node_id, enum mesh_ring_direction dir, size_t bytes);
+
+/* Get ring hop count in a direction */
+int mesh_ring_hop_count(uint32_t dest_node_id, enum mesh_ring_direction direction);
+
+/* Check if we're a ring neighbor of a node */
+int mesh_ring_is_neighbor(uint32_t node_id);
+
+/* Dump ring state to log */
+void mesh_ring_dump_state(void);
+
+/*
+ * Line topology functions
+ */
+
+/* Initialize line topology state */
+int mesh_line_init(void);
+
+/* Build line order from adjacency information */
+int mesh_line_build_order(void);
+
+/* Detect and record line endpoints */
+int mesh_line_detect_endpoints(void);
+
+/* Check if we are a line endpoint */
+int mesh_line_is_endpoint(void);
+
+/* Check if a node is a line endpoint */
+int mesh_line_node_is_endpoint(uint32_t node_id);
+
+/* Get direction to destination (towards head or tail) */
+int mesh_line_get_direction(uint32_t dest_node_id);  /* -1=head, 1=tail, 0=error */
+
+/* Get hop count to destination */
+int mesh_line_hop_count(uint32_t dest_node_id);
+
+/* Get next hop towards a destination */
+uint32_t mesh_line_get_next_hop(uint32_t dest_node_id);
+
+/* Check if we're between two nodes (for relay decisions) */
+int mesh_line_is_between(uint32_t src_node_id, uint32_t dst_node_id);
+
+/* Dump line state to log */
+void mesh_line_dump_state(void);
+
+/*
+ * Topology-aware routing optimization
+ */
+
+/* Initialize topology-specific optimizations (call after topology detection) */
+int mesh_topo_optimize_init(void);
+
+/* Get optimized route considering topology */
+int mesh_topo_get_optimized_route(uint32_t dest_node_id, struct mesh_route_entry *route);
+
+/* Select best path for a message (considers load balancing for ring) */
+int mesh_topo_select_path(uint32_t dest_node_id, size_t msg_size,
+                          uint32_t *next_hop_id, uint32_t *next_hop_ip);
+
 #endif /* MESH_ROUTING_H */
