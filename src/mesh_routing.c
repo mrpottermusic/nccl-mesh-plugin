@@ -607,6 +607,12 @@ int mesh_build_routing_table(void) {
     MESH_INFO("Routing table built: topology=%s", mesh_topology_name(g_mesh_routing.fast_topology));
     mesh_dump_routing_table();
 
+    /* Initialize topology-specific optimizations (ring dual-path, line endpoint detection) */
+    if (mesh_topo_optimize_init() != 0) {
+        MESH_WARN("Topology optimization init failed, using basic routing");
+        /* Non-fatal - basic BFS routing will still work */
+    }
+
     return 0;
 }
 
